@@ -24,7 +24,10 @@ Each operation is one direct Messages API loop — no subprocess, no coding-agen
 
 - **ingest-agent** — extracts summary, entities, topics, and importance from new input, then searches for closely related existing memories: duplicates and corrections **update the existing memory in place** (`update_memory`); genuinely new information is stored (`store_memory`). A verification retry ensures ingestion never fails silently.
 - **consolidate-agent** — periodically reviews unconsolidated memories, finds connections, and stores cross-cutting insights
+- **meta-consolidate-agent** — once enough insights accumulate, rolls them up into **higher-level insights** (hierarchical consolidation — insights of insights)
 - **query-agent** — retrieves memories via **full-text search** (SQLite FTS5) and answers with `[Memory N]` citations. Search-based retrieval scales to large memory stores instead of loading everything into context.
+
+Memories also **decay**: once consolidated, a memory's effective importance fades with age, and low-importance old memories are archived — the details are forgotten, the insights remain.
 
 Every operation logs its turn count, duration, and cost, so you can watch what 24/7 operation actually costs.
 
@@ -66,17 +69,22 @@ Ingestion has three layers of protection against waste and loss:
 - **Fuzzy duplicates and corrections update in place** — the ingest agent searches existing memories first; if the new input covers or corrects something already stored (e.g. "the launch slipped from March 15 to April 1"), it updates that memory instead of creating a near-duplicate, and re-queues it for consolidation
 - **Failures are retried, not swallowed** — a file that fails to ingest (e.g. transient API outage) stays unmarked and is retried on later polls, up to 3 attempts per file version
 
-Modified inbox files are re-ingested automatically (the watcher tracks modification times). Write operations (ingest, consolidate) are serialized through a mutex so overlapping triggers can't double-process; read-only queries run concurrently.
+Modified inbox files are re-ingested automatically (the watcher tracks modification times). **Ingestion is parallel** — up to 3 ingests run concurrently (bulk drops don't queue serially), while the consolidation cycle takes exclusive access via a reader-writer gate so it never overlaps with in-flight writes. Read-only queries run unrestricted.
 
-**Three ways to ingest:**
+**Four ways to ingest:**
 
-- **File watcher**: drop a supported file in the inbox folder — the agent picks it up within ~5 seconds
+- **File watcher**: drop supported files in the inbox folder — the agent picks them up within ~5 seconds, in parallel
 - **HTTP API**: `POST /ingest` with text content
 - **Dashboard**: the built-in web UI at `http://127.0.0.1:8888/`
+- **Bulk import**: `npm run import -- ./corpus` submits a directory of text files through the [Message Batches API](https://platform.claude.com/docs/en/build-with-claude/batch-processing) at **50% of standard prices** — ideal for one-time backfills. Batch requests use structured outputs instead of the tool loop; results are inserted directly into the store, and the same hash-dedup applies, so re-running an import only processes new files.
 
 ### 2. Consolidate
 
-The **consolidate-agent** runs on a timer (default: every 30 minutes). Like the human brain during sleep, it reviews unconsolidated memories, finds connections between them, generates cross-cutting insights, and compresses related information.
+The consolidation cycle runs on a timer (default: every 30 minutes). Like the human brain during sleep, it works in three stages:
+
+1. **Consolidate** — the consolidate-agent reviews unconsolidated memories, finds connections between them, and stores a cross-cutting insight
+2. **Roll up (hierarchical consolidation)** — once 3+ insights have accumulated, the meta-consolidate-agent rolls them up into a single higher-level insight ("insights of insights"); levels stack as knowledge accumulates, and the query agent sees the most abstract insights first
+3. **Decay** — consolidated memories are archived once their age-discounted importance falls below a threshold (importance halves every 30 days by default). Archived memories disappear from reads and search, but their essence lives on in the insights — like the brain forgetting episodic detail while keeping the lesson. Tune or disable via the `[decay]` settings.
 
 ### 3. Query
 
@@ -205,6 +213,13 @@ Relative paths are resolved against the directory the agent is started from.
 
 If a setting is missing everywhere — not in `config.ini`, not in the environment, and (for the inbox) no `--watch` flag — the agent exits at startup with a message naming the missing key.
 
+**Decay settings** (optional, under `[decay]`):
+
+| `[decay]` key    | Env var                       | Default | Description |
+| ---------------- | ----------------------------- | ------- | ----------- |
+| `half_life_days` | `MEMORY_DECAY_HALF_LIFE_DAYS` | `30`    | Effective importance halves every this many days |
+| `threshold`      | `MEMORY_DECAY_THRESHOLD`      | `0.15`  | Consolidated memories below this effective importance are archived. Set `0` to disable decay. |
+
 **Server settings** (optional, under `[server]`):
 
 | `[server]` key | Env var            | Default     | Description |
@@ -258,8 +273,10 @@ npm run typecheck
 always-on-memory-agent/
 ├── src/
 │   ├── main.ts        # Entry point: watcher + timer + HTTP server
-│   ├── agent.ts       # Specialist agents (Anthropic SDK tool runner)
+│   ├── agent.ts       # Specialist agents + operation gate (SDK tool runner)
 │   ├── tools.ts       # Memory tools (betaZodTool definitions)
+│   ├── importer.ts    # Bulk import via the Message Batches API
+│   ├── import.ts      # CLI entry for npm run import
 │   ├── db.ts          # SQLite memory store + FTS5 search (node:sqlite)
 │   ├── config.ts      # INI config loader (config.ini)
 │   ├── dashboard.ts   # Single-page web dashboard (served at GET /)

@@ -59,7 +59,8 @@ async function refresh() {
   document.getElementById('stats').innerHTML =
     '<div><b>' + s.total_memories + '</b> memories</div>' +
     '<div><b>' + s.unconsolidated + '</b> unconsolidated</div>' +
-    '<div><b>' + s.consolidations + '</b> consolidations</div>';
+    '<div><b>' + s.consolidations + '</b> insights (max level ' + s.max_insight_level + ')</div>' +
+    '<div><b>' + s.archived + '</b> archived</div>';
   const data = await call('GET', '/memories');
   document.getElementById('memories').innerHTML = data.count === 0 ? '<p class="muted">No memories yet.</p>' :
     '<table><tr><th>ID</th><th>Summary</th><th>Topics</th><th>Source</th><th></th></tr>' +

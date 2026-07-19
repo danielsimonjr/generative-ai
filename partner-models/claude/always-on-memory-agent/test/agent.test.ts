@@ -174,3 +174,47 @@ test("query specialist gets search tools and returns the final answer", async ()
   const fed = requests.at(-1).messages.at(-1).content.find((b: any) => b.type === "tool_result");
   assert.match(JSON.stringify(fed.content), /Revenue target 2M/);
 });
+
+test("consolidation cycle runs the consolidate specialist and reports", async () => {
+  // Two unconsolidated memories exist from the tests above
+  script = [
+    () =>
+      message(
+        [{ type: "tool_use", id: "toolu_5", name: "read_unconsolidated_memories", input: {} }],
+        "tool_use",
+      ),
+    () =>
+      message(
+        [
+          {
+            type: "tool_use",
+            id: "toolu_6",
+            name: "store_consolidation",
+            input: {
+              source_ids: [1, 2],
+              summary: "revenue and staffing plans",
+              insight: "growth planning underway",
+              connections: [{ from_id: 1, to_id: 2, relationship: "supports" }],
+            },
+          },
+        ],
+        "tool_use",
+      ),
+    () => message([{ type: "text", text: "Consolidated 2 memories." }], "end_turn"),
+  ];
+
+  const agent = new MemoryAgent();
+  const result = await agent.consolidate();
+
+  assert.match(result, /Consolidated 2 memories\./);
+  assert.equal(script.length, 0);
+  assert.equal(db.getMemoryStats().unconsolidated, 0);
+  // Only 1 pending insight (< 3) — the meta-consolidation stage must not run,
+  // and with no decay options the archive stage is skipped
+  assert.equal(db.readUnconsolidatedConsolidations().count, 1);
+
+  // A second cycle with nothing to do makes no API calls at all
+  script = [];
+  const idle = await new MemoryAgent().consolidate();
+  assert.match(idle, /Nothing to consolidate/);
+});

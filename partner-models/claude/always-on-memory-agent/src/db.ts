@@ -48,11 +48,19 @@ export function getDb(): DatabaseSync {
         created_at TEXT NOT NULL
       );
     `);
-    // Migrate databases created before the mtime_ms column existed
-    try {
-      db.exec("ALTER TABLE processed_files ADD COLUMN mtime_ms REAL NOT NULL DEFAULT 0");
-    } catch {
-      // column already exists
+    // Migrations for databases created by earlier versions (each ALTER
+    // fails harmlessly when the column already exists)
+    for (const migration of [
+      "ALTER TABLE processed_files ADD COLUMN mtime_ms REAL NOT NULL DEFAULT 0",
+      "ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE consolidations ADD COLUMN level INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE consolidations ADD COLUMN consolidated INTEGER NOT NULL DEFAULT 0",
+    ]) {
+      try {
+        db.exec(migration);
+      } catch {
+        // column already exists
+      }
     }
     // Full-text index over memories, kept in sync by triggers
     db.exec(`
@@ -129,7 +137,7 @@ export function storeMemory(args: {
 
 export function readAllMemories() {
   const rows = getDb()
-    .prepare("SELECT * FROM memories ORDER BY created_at DESC LIMIT 50")
+    .prepare("SELECT * FROM memories WHERE archived = 0 ORDER BY created_at DESC LIMIT 50")
     .all() as Record<string, unknown>[];
   const memories = rows.map(rowToMemory);
   return { memories, count: memories.length };
@@ -161,7 +169,7 @@ export function searchMemories(searchQuery: string, limit = 10) {
   const rows = getDb()
     .prepare(
       `SELECT m.* FROM memories_fts f JOIN memories m ON m.id = f.rowid
-       WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?`,
+       WHERE memories_fts MATCH ? AND m.archived = 0 ORDER BY rank LIMIT ?`,
     )
     .all(terms.join(" OR "), limit) as Record<string, unknown>[];
   const memories = rows.map(rowToMemory);
@@ -201,7 +209,9 @@ export function updateMemory(args: {
 
 export function readUnconsolidatedMemories() {
   const rows = getDb()
-    .prepare("SELECT * FROM memories WHERE consolidated = 0 ORDER BY created_at DESC LIMIT 10")
+    .prepare(
+      "SELECT * FROM memories WHERE consolidated = 0 AND archived = 0 ORDER BY created_at DESC LIMIT 10",
+    )
     .all() as Record<string, unknown>[];
   const memories = rows.map((r) => ({
     id: r.id as number,
@@ -262,26 +272,129 @@ export function storeConsolidation(args: {
 
 export function readConsolidationHistory() {
   const rows = getDb()
-    .prepare("SELECT * FROM consolidations ORDER BY created_at DESC LIMIT 10")
+    .prepare("SELECT * FROM consolidations ORDER BY level DESC, created_at DESC LIMIT 10")
     .all() as Record<string, unknown>[];
   const consolidations = rows.map((r) => ({
+    id: r.id as number,
     summary: r.summary as string,
     insight: r.insight as string,
     source_ids: r.source_ids as string,
+    level: r.level as number,
   }));
   return { consolidations, count: consolidations.length };
 }
 
+/** Level-N insights that haven't been rolled up into a higher level yet. */
+export function readUnconsolidatedConsolidations() {
+  const rows = getDb()
+    .prepare(
+      "SELECT * FROM consolidations WHERE consolidated = 0 ORDER BY created_at DESC LIMIT 10",
+    )
+    .all() as Record<string, unknown>[];
+  const consolidations = rows.map((r) => ({
+    id: r.id as number,
+    summary: r.summary as string,
+    insight: r.insight as string,
+    level: r.level as number,
+    created_at: r.created_at as string,
+  }));
+  return { consolidations, count: consolidations.length };
+}
+
+/**
+ * Hierarchical consolidation: roll several insights up into one
+ * higher-level insight ("insights of insights") and mark the sources
+ * as consolidated.
+ */
+export function storeMetaConsolidation(args: {
+  source_consolidation_ids: number[];
+  summary: string;
+  insight: string;
+}) {
+  const database = getDb();
+  const placeholders = args.source_consolidation_ids.map(() => "?").join(",");
+  const maxLevelRow = database
+    .prepare(`SELECT MAX(level) as l FROM consolidations WHERE id IN (${placeholders})`)
+    .get(...args.source_consolidation_ids) as { l: number | null };
+  const level = (maxLevelRow.l ?? 1) + 1;
+  database
+    .prepare(
+      "INSERT INTO consolidations (source_ids, summary, insight, created_at, level) VALUES (?, ?, ?, ?, ?)",
+    )
+    .run(
+      JSON.stringify(args.source_consolidation_ids),
+      args.summary,
+      args.insight,
+      new Date().toISOString(),
+      level,
+    );
+  database
+    .prepare(`UPDATE consolidations SET consolidated = 1 WHERE id IN (${placeholders})`)
+    .run(...args.source_consolidation_ids);
+  console.log(
+    `[${time()}] 🧬 Meta-consolidated ${args.source_consolidation_ids.length} insights ` +
+      `into level ${level}: ${args.insight.slice(0, 70)}...`,
+  );
+  return {
+    status: "meta_consolidated",
+    level,
+    insights_processed: args.source_consolidation_ids.length,
+  };
+}
+
+/**
+ * Memory decay: archive consolidated memories whose age-discounted
+ * importance has fallen below the threshold. Effective importance halves
+ * every `halfLifeDays`; archived memories disappear from reads and search
+ * but their essence lives on in consolidation insights. Returns the number
+ * archived. A threshold of 0 disables decay.
+ */
+export function archiveDecayedMemories(halfLifeDays: number, threshold: number): number {
+  if (threshold <= 0 || halfLifeDays <= 0) return 0;
+  const database = getDb();
+  const rows = database
+    .prepare("SELECT id, importance, created_at FROM memories WHERE archived = 0 AND consolidated = 1")
+    .all() as { id: number; importance: number; created_at: string }[];
+  const now = Date.now();
+  const toArchive = rows.filter((r) => {
+    const ageDays = (now - Date.parse(r.created_at)) / 86_400_000;
+    return r.importance * Math.pow(0.5, ageDays / halfLifeDays) < threshold;
+  });
+  for (const r of toArchive) {
+    database.prepare("UPDATE memories SET archived = 1 WHERE id = ?").run(r.id);
+  }
+  if (toArchive.length > 0) {
+    console.log(`[${time()}] 🍂 Archived ${toArchive.length} decayed memories`);
+  }
+  return toArchive.length;
+}
+
 export function getMemoryStats() {
   const database = getDb();
-  const total = (database.prepare("SELECT COUNT(*) as c FROM memories").get() as { c: number }).c;
+  const total = (
+    database.prepare("SELECT COUNT(*) as c FROM memories WHERE archived = 0").get() as { c: number }
+  ).c;
   const unconsolidated = (
-    database.prepare("SELECT COUNT(*) as c FROM memories WHERE consolidated = 0").get() as { c: number }
+    database
+      .prepare("SELECT COUNT(*) as c FROM memories WHERE consolidated = 0 AND archived = 0")
+      .get() as { c: number }
+  ).c;
+  const archived = (
+    database.prepare("SELECT COUNT(*) as c FROM memories WHERE archived = 1").get() as { c: number }
   ).c;
   const consolidations = (
     database.prepare("SELECT COUNT(*) as c FROM consolidations").get() as { c: number }
   ).c;
-  return { total_memories: total, unconsolidated, consolidations };
+  const maxLevel = (
+    database.prepare("SELECT COALESCE(MAX(level), 0) as l FROM consolidations").get() as { l: number }
+  ).l;
+  return {
+    total_memories: total,
+    unconsolidated,
+    archived,
+    consolidations,
+    max_insight_level: maxLevel,
+  };
 }
 
 export function deleteMemory(memoryId: number) {
