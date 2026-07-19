@@ -140,6 +140,19 @@ test("ingest retries once when the model stores nothing", async () => {
   assert.equal(script.length, 0);
 });
 
+test("identical content is skipped without any API call", async () => {
+  script = []; // any request would fail with "script exhausted"
+  const requestsBefore = requests.length;
+
+  const agent = new MemoryAgent();
+  // Same text as the first ingest test — its hash was recorded on success
+  const result = await agent.ingest("Quarterly revenue target is 2 million dollars", "test");
+
+  assert.match(result, /already ingested/);
+  assert.equal(requests.length, requestsBefore); // no model call happened
+  assert.equal(db.readAllMemories().count, 2); // nothing new stored
+});
+
 test("query specialist gets search tools and returns the final answer", async () => {
   script = [
     () =>

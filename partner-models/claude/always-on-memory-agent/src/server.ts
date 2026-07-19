@@ -25,13 +25,33 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown> | null> {
+const MAX_BODY_BYTES = 1024 * 1024; // 1 MB — plenty for text ingestion
+
+type ParsedBody =
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; status: number; error: string };
+
+async function readJsonBody(req: http.IncomingMessage): Promise<ParsedBody> {
+  // Reject oversized uploads before reading — the client gets a clean 413
+  const declared = Number(req.headers["content-length"] ?? 0);
+  if (declared > MAX_BODY_BYTES) {
+    return { ok: false, status: 413, error: "payload too large (limit 1MB)" };
+  }
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
+  let size = 0;
+  // Backstop for chunked uploads that never declared a length
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY_BYTES) {
+      req.destroy();
+      return { ok: false, status: 413, error: "payload too large (limit 1MB)" };
+    }
+    chunks.push(chunk as Buffer);
+  }
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+    return { ok: true, body: JSON.parse(Buffer.concat(chunks).toString("utf-8")) };
   } catch {
-    return null;
+    return { ok: false, status: 400, error: "invalid JSON" };
   }
 }
 
@@ -49,7 +69,21 @@ export function buildServer(
   watchPath: string,
   apiToken?: string,
 ): http.Server {
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(handler);
+  // Large uploads announce themselves with Expect: 100-continue — reject
+  // oversized ones here, before the client ever sends the body
+  server.on("checkContinue", (req, res) => {
+    if (Number(req.headers["content-length"] ?? 0) > MAX_BODY_BYTES) {
+      res.writeHead(413, { "Content-Type": "application/json", Connection: "close" });
+      res.end(JSON.stringify({ error: "payload too large (limit 1MB)" }));
+      return;
+    }
+    res.writeContinue();
+    void handler(req, res);
+  });
+  return server;
+
+  async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const route = `${req.method} ${url.pathname}`;
 
@@ -77,11 +111,11 @@ export function buildServer(
           return json(res, 200, { question: q, answer });
         }
         case "POST /ingest": {
-          const body = await readJsonBody(req);
-          if (!body) return json(res, 400, { error: "invalid JSON" });
-          const text = typeof body.text === "string" ? body.text.trim() : "";
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) return json(res, parsed.status, { error: parsed.error });
+          const text = typeof parsed.body.text === "string" ? parsed.body.text.trim() : "";
           if (!text) return json(res, 400, { error: "missing 'text' field" });
-          const source = typeof body.source === "string" ? body.source : "api";
+          const source = typeof parsed.body.source === "string" ? parsed.body.source : "api";
           const result = await agent.ingest(text, source);
           return json(res, 200, { status: "ingested", response: result });
         }
@@ -90,9 +124,9 @@ export function buildServer(
           return json(res, 200, { status: "done", response: result });
         }
         case "POST /delete": {
-          const body = await readJsonBody(req);
-          if (!body) return json(res, 400, { error: "invalid JSON" });
-          const memoryId = Number(body.memory_id);
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) return json(res, parsed.status, { error: parsed.error });
+          const memoryId = Number(parsed.body.memory_id);
           if (!memoryId) return json(res, 400, { error: "missing 'memory_id' field" });
           return json(res, 200, deleteMemory(memoryId));
         }
@@ -128,5 +162,5 @@ export function buildServer(
       console.error(`[${time()}] Request error:`, err);
       return json(res, 500, { error: String(err) });
     }
-  });
+  }
 }

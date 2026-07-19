@@ -98,6 +98,14 @@ test("tracks processed files by path and mtime", () => {
   assert.equal(db.isFileProcessed("/x/a.txt", 200), true);
 });
 
+test("records and checks ingest hashes for the dedup fast path", () => {
+  assert.equal(db.hasIngestHash("abc123"), false);
+  db.recordIngestHash("abc123");
+  assert.equal(db.hasIngestHash("abc123"), true);
+  db.recordIngestHash("abc123"); // idempotent
+  assert.equal(db.hasIngestHash("abc123"), true);
+});
+
 test("clearAllMemories wipes every table", () => {
   db.storeMemory({ raw_text: "x", summary: "x", entities: [], topics: [], importance: 0.5 });
   const removed = db.clearAllMemories();
@@ -105,4 +113,5 @@ test("clearAllMemories wipes every table", () => {
   assert.equal(db.readAllMemories().count, 0);
   assert.equal(db.getMemoryStats().consolidations, 0);
   assert.equal(db.isFileProcessed("/x/a.txt", 200), false);
+  assert.equal(db.hasIngestHash("abc123"), false);
 });

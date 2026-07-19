@@ -9,6 +9,9 @@ import { isFileProcessed, markFileProcessed, time } from "./db.js";
 import { ALL_SUPPORTED, TEXT_EXTENSIONS, UNSUPPORTED_MEDIA } from "./filetypes.js";
 
 const MAX_TEXT_CHARS = 10_000;
+// A transient failure (e.g. API outage) leaves the file unmarked so it's
+// retried on later polls; give up after this many attempts per file version.
+const MAX_ATTEMPTS = 3;
 
 export function startWatcher(
   agent: MemoryAgent,
@@ -20,6 +23,7 @@ export function startWatcher(
 
   let stopped = false;
   let running = false;
+  const attempts = new Map<string, number>(); // "path:mtime" -> failed tries
 
   const tick = async () => {
     if (stopped || running) return;
@@ -43,6 +47,7 @@ export function startWatcher(
         }
         if (isFileProcessed(filePath, mtimeMs)) continue;
 
+        const attemptKey = `${filePath}:${mtimeMs}`;
         try {
           if (TEXT_EXTENSIONS.has(ext)) {
             console.log(`[${time()}] 📄 New text file: ${name}`);
@@ -54,10 +59,23 @@ export function startWatcher(
             console.log(`[${time()}] 🖼️  New media file: ${name}`);
             await agent.ingestFile(filePath);
           }
+          markFileProcessed(filePath, mtimeMs);
+          attempts.delete(attemptKey);
         } catch (err) {
-          console.error(`[${time()}] Error ingesting ${name}:`, err);
+          const tries = (attempts.get(attemptKey) ?? 0) + 1;
+          attempts.set(attemptKey, tries);
+          if (tries >= MAX_ATTEMPTS) {
+            // Persistent failure — stop retrying this file version
+            console.error(`[${time()}] ❌ Giving up on ${name} after ${tries} attempts:`, err);
+            markFileProcessed(filePath, mtimeMs);
+            attempts.delete(attemptKey);
+          } else {
+            console.error(
+              `[${time()}] Error ingesting ${name} (attempt ${tries}/${MAX_ATTEMPTS}, will retry):`,
+              err,
+            );
+          }
         }
-        markFileProcessed(filePath, mtimeMs);
       }
     } catch (err) {
       console.error(`[${time()}] Watch error:`, err);
