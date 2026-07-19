@@ -47,7 +47,24 @@ function loadConfigFile(): Record<string, string> {
 
 const fileConfig = loadConfigFile();
 
-/** Resolve a setting: environment variable > config.ini key > default. */
-export function setting(envVar: string, iniKey: string, fallback: string): string {
-  return process.env[envVar] ?? fileConfig[iniKey] ?? fallback;
+/** Resolve a setting: environment variable > config.ini key. */
+export function setting(envVar: string, iniKey: string): string | undefined {
+  return process.env[envVar] ?? fileConfig[iniKey];
+}
+
+/**
+ * Resolve a setting that has no built-in default — config.ini is the
+ * canonical source. Exits with a clear message when unset everywhere.
+ */
+export function requireSetting(envVar: string, iniKey: string): string {
+  const value = setting(envVar, iniKey);
+  if (!value) {
+    const [section, key] = iniKey.split(".");
+    console.error(
+      `Missing required setting: add "${key} = <path>" under [${section}] in ` +
+        `${CONFIG_PATH} (or set the ${envVar} environment variable).`,
+    );
+    process.exit(1);
+  }
+  return value;
 }
