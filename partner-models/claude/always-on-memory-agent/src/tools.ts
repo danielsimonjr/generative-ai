@@ -93,7 +93,26 @@ export const storeConsolidation = betaZodTool({
 
 export const readConsolidationHistory = betaZodTool({
   name: "read_consolidation_history",
-  description: "Read past consolidation insights.",
+  description: "Read past consolidation insights, highest level (most abstract) first.",
   inputSchema: z.object({}),
   run: async () => jsonText(db.readConsolidationHistory()),
+});
+
+export const readUnconsolidatedConsolidations = betaZodTool({
+  name: "read_unconsolidated_consolidations",
+  description: "Read insights that haven't been rolled up into a higher-level insight yet.",
+  inputSchema: z.object({}),
+  run: async () => jsonText(db.readUnconsolidatedConsolidations()),
+});
+
+export const storeMetaConsolidation = betaZodTool({
+  name: "store_meta_consolidation",
+  description:
+    "Roll several existing insights up into one higher-level insight and mark them as consolidated.",
+  inputSchema: z.object({
+    source_consolidation_ids: z.array(z.number().int()).describe("IDs of the insights being rolled up"),
+    summary: z.string().describe("A synthesized summary across the source insights"),
+    insight: z.string().describe("The single higher-level pattern that emerges"),
+  }),
+  run: async (input) => jsonText(db.storeMetaConsolidation(input)),
 });

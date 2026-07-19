@@ -25,12 +25,47 @@ export function startWatcher(
   let running = false;
   const attempts = new Map<string, number>(); // "path:mtime" -> failed tries
 
+  const processFile = async (name: string, filePath: string, mtimeMs: number) => {
+    const ext = path.extname(name).toLowerCase();
+    const attemptKey = `${filePath}:${mtimeMs}`;
+    try {
+      if (TEXT_EXTENSIONS.has(ext)) {
+        console.log(`[${time()}] 📄 New text file: ${name}`);
+        const text = fs.readFileSync(filePath, "utf-8").slice(0, MAX_TEXT_CHARS);
+        if (text.trim()) {
+          await agent.ingest(text, name);
+        }
+      } else {
+        console.log(`[${time()}] 🖼️  New media file: ${name}`);
+        await agent.ingestFile(filePath);
+      }
+      markFileProcessed(filePath, mtimeMs);
+      attempts.delete(attemptKey);
+    } catch (err) {
+      const tries = (attempts.get(attemptKey) ?? 0) + 1;
+      attempts.set(attemptKey, tries);
+      if (tries >= MAX_ATTEMPTS) {
+        // Persistent failure — stop retrying this file version
+        console.error(`[${time()}] ❌ Giving up on ${name} after ${tries} attempts:`, err);
+        markFileProcessed(filePath, mtimeMs);
+        attempts.delete(attemptKey);
+      } else {
+        console.error(
+          `[${time()}] Error ingesting ${name} (attempt ${tries}/${MAX_ATTEMPTS}, will retry):`,
+          err,
+        );
+      }
+    }
+  };
+
   const tick = async () => {
     if (stopped || running) return;
     running = true;
     try {
-      const entries = fs.readdirSync(folder).sort();
-      for (const name of entries) {
+      // Collect everything eligible, then ingest in parallel — the agent's
+      // operation gate bounds actual LLM concurrency
+      const pending: { name: string; filePath: string; mtimeMs: number }[] = [];
+      for (const name of fs.readdirSync(folder).sort()) {
         if (name.startsWith(".")) continue;
         const filePath = path.join(folder, name);
         const stat = fs.statSync(filePath);
@@ -46,37 +81,9 @@ export function startWatcher(
           continue;
         }
         if (isFileProcessed(filePath, mtimeMs)) continue;
-
-        const attemptKey = `${filePath}:${mtimeMs}`;
-        try {
-          if (TEXT_EXTENSIONS.has(ext)) {
-            console.log(`[${time()}] 📄 New text file: ${name}`);
-            const text = fs.readFileSync(filePath, "utf-8").slice(0, MAX_TEXT_CHARS);
-            if (text.trim()) {
-              await agent.ingest(text, name);
-            }
-          } else {
-            console.log(`[${time()}] 🖼️  New media file: ${name}`);
-            await agent.ingestFile(filePath);
-          }
-          markFileProcessed(filePath, mtimeMs);
-          attempts.delete(attemptKey);
-        } catch (err) {
-          const tries = (attempts.get(attemptKey) ?? 0) + 1;
-          attempts.set(attemptKey, tries);
-          if (tries >= MAX_ATTEMPTS) {
-            // Persistent failure — stop retrying this file version
-            console.error(`[${time()}] ❌ Giving up on ${name} after ${tries} attempts:`, err);
-            markFileProcessed(filePath, mtimeMs);
-            attempts.delete(attemptKey);
-          } else {
-            console.error(
-              `[${time()}] Error ingesting ${name} (attempt ${tries}/${MAX_ATTEMPTS}, will retry):`,
-              err,
-            );
-          }
-        }
+        pending.push({ name, filePath, mtimeMs });
       }
+      await Promise.all(pending.map((f) => processFile(f.name, f.filePath, f.mtimeMs)));
     } catch (err) {
       console.error(`[${time()}] Watch error:`, err);
     } finally {

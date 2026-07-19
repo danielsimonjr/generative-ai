@@ -18,7 +18,7 @@ import { parseArgs } from "node:util";
 
 import { MemoryAgent, MODEL } from "./agent.js";
 import { requireSetting, setting } from "./config.js";
-import { DB_PATH, getDb, time } from "./db.js";
+import { DB_PATH, time } from "./db.js";
 import { buildServer } from "./server.js";
 import { startWatcher } from "./watcher.js";
 
@@ -35,8 +35,12 @@ const port = Number(values.port);
 const consolidateEveryMin = Number(values["consolidate-every"]);
 const host = setting("MEMORY_HOST", "server.host") ?? "127.0.0.1";
 const apiToken = setting("MEMORY_API_TOKEN", "server.token");
+const decay = {
+  halfLifeDays: Number(setting("MEMORY_DECAY_HALF_LIFE_DAYS", "decay.half_life_days") ?? 30),
+  threshold: Number(setting("MEMORY_DECAY_THRESHOLD", "decay.threshold") ?? 0.15),
+};
 
-const agent = new MemoryAgent();
+const agent = new MemoryAgent(decay);
 
 if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
   console.warn(
@@ -57,21 +61,19 @@ console.log("");
 // File watcher
 const watcher = startWatcher(agent, watchDir);
 
-// Consolidation timer — like sleep cycles
-console.log(`[${time()}] 🔄 Consolidation: every ${consolidateEveryMin} minutes`);
+// Consolidation cycle timer — like sleep cycles: consolidate memories,
+// roll accumulated insights up a level, archive decayed memories.
+// The cycle itself skips whatever has nothing to do.
+console.log(
+  `[${time()}] 🔄 Consolidation: every ${consolidateEveryMin} minutes ` +
+    `(decay: half-life ${decay.halfLifeDays}d, threshold ${decay.threshold})`,
+);
 const consolidationTimer = setInterval(
   async () => {
     try {
-      const { c } = getDb()
-        .prepare("SELECT COUNT(*) as c FROM memories WHERE consolidated = 0")
-        .get() as { c: number };
-      if (c >= 2) {
-        console.log(`[${time()}] 🔄 Running consolidation (${c} unconsolidated memories)...`);
-        const result = await agent.consolidate();
-        console.log(`[${time()}] 🔄 ${result.slice(0, 100)}`);
-      } else {
-        console.log(`[${time()}] 🔄 Skipping consolidation (${c} unconsolidated memories)`);
-      }
+      console.log(`[${time()}] 🔄 Running consolidation cycle...`);
+      const result = await agent.consolidate();
+      console.log(`[${time()}] 🔄 ${result.slice(0, 120)}`);
     } catch (err) {
       console.error(`[${time()}] Consolidation error:`, err);
     }

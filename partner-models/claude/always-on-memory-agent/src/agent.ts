@@ -1,11 +1,15 @@
 /**
- * The memory agents: three specialists (ingest, consolidate, query), all
- * running on Claude Haiku via the Anthropic SDK's tool runner.
+ * The memory agents: specialists for ingest, consolidate, meta-consolidate,
+ * and query, all running on Claude Haiku via the Anthropic SDK's tool runner.
  *
  * Each operation is a single scoped tool-runner call with that specialist's
  * system prompt and tools — no orchestrator hop, no subprocess. Media files
  * (images, PDFs) are sent inline as base64 content blocks, so the agents
  * have no filesystem access at all.
+ *
+ * Concurrency model: ingests run in parallel (up to INGEST_CONCURRENCY);
+ * the consolidation cycle takes exclusive access so it never overlaps with
+ * itself or with in-flight ingests. Queries are read-only and unrestricted.
  */
 import Anthropic from "@anthropic-ai/sdk";
 import type { BetaContentBlockParam } from "@anthropic-ai/sdk/resources/beta";
@@ -14,7 +18,14 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { getMemoryStats, hasIngestHash, recordIngestHash, time } from "./db.js";
+import {
+  archiveDecayedMemories,
+  getMemoryStats,
+  hasIngestHash,
+  readUnconsolidatedConsolidations,
+  recordIngestHash,
+  time,
+} from "./db.js";
 import { MEDIA_EXTENSIONS } from "./filetypes.js";
 import * as tools from "./tools.js";
 
@@ -25,6 +36,13 @@ const INPUT_PRICE = 1 / 1e6;
 const OUTPUT_PRICE = 5 / 1e6;
 
 const MAX_MEDIA_BYTES = 20 * 1024 * 1024; // stay under the 32MB request limit after base64
+const INGEST_CONCURRENCY = 3;
+const META_CONSOLIDATION_MIN = 3; // roll insights up once this many are pending
+
+export interface DecayOptions {
+  halfLifeDays: number;
+  threshold: number;
+}
 
 function makeClient(): Anthropic {
   try {
@@ -41,21 +59,63 @@ function makeClient(): Anthropic {
 const client = makeClient();
 
 /**
- * Serializes memory-writing operations (ingest, consolidate) so that e.g.
- * two consolidations can't process the same unconsolidated memories twice.
- * Queries are read-only and run concurrently.
+ * Reader-writer gate for memory-writing operations. Ingests share access
+ * (bounded by maxShared); the consolidation cycle is exclusive — it waits
+ * for in-flight ingests to drain and blocks new ones while it runs.
+ * Admission is FIFO, so a waiting consolidation can't be starved by a
+ * stream of new ingests.
  */
-class Mutex {
-  private tail: Promise<unknown> = Promise.resolve();
+export class OperationGate {
+  private activeShared = 0;
+  private exclusiveActive = false;
+  private waiters: { exclusive: boolean; admit: () => void }[] = [];
 
-  run<T>(fn: () => Promise<T>): Promise<T> {
-    const result = this.tail.then(fn, fn);
-    this.tail = result.catch(() => {});
-    return result;
+  constructor(private readonly maxShared: number) {}
+
+  private admitFromQueue(): void {
+    while (this.waiters.length > 0) {
+      const head = this.waiters[0];
+      if (head.exclusive) {
+        if (this.exclusiveActive || this.activeShared > 0) return;
+        this.exclusiveActive = true;
+      } else {
+        if (this.exclusiveActive || this.activeShared >= this.maxShared) return;
+        this.activeShared++;
+      }
+      this.waiters.shift();
+      head.admit();
+    }
+  }
+
+  private acquire(exclusive: boolean): Promise<void> {
+    return new Promise((admit) => {
+      this.waiters.push({ exclusive, admit });
+      this.admitFromQueue();
+    });
+  }
+
+  async runShared<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire(false);
+    try {
+      return await fn();
+    } finally {
+      this.activeShared--;
+      this.admitFromQueue();
+    }
+  }
+
+  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire(true);
+    try {
+      return await fn();
+    } finally {
+      this.exclusiveActive = false;
+      this.admitFromQueue();
+    }
   }
 }
 
-const writeMutex = new Mutex();
+const gate = new OperationGate(INGEST_CONCURRENCY);
 
 const sha256 = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
 
@@ -119,6 +179,22 @@ const CONSOLIDATE_AGENT: Specialist = {
   tools: [tools.readUnconsolidatedMemories, tools.storeConsolidation],
 };
 
+const META_CONSOLIDATE_AGENT: Specialist = {
+  name: "meta-consolidate",
+  prompt: [
+    "You are a Meta-Consolidation Agent. Like the brain forming abstract",
+    "knowledge from episodic memories, you roll existing insights up into",
+    "higher-level understanding. You:",
+    "1. Call read_unconsolidated_consolidations to see the pending insights",
+    "2. If fewer than 2, say nothing to roll up",
+    "3. Find the deeper pattern that connects them — not a restatement, but",
+    "   what they jointly reveal",
+    "4. Call store_meta_consolidation with source_consolidation_ids, a",
+    "   synthesized summary, and the single higher-level insight",
+  ].join("\n"),
+  tools: [tools.readUnconsolidatedConsolidations, tools.storeMetaConsolidation],
+};
+
 const QUERY_AGENT: Specialist = {
   name: "query",
   prompt: [
@@ -144,12 +220,22 @@ const QUERY_AGENT: Specialist = {
   tools: [tools.searchMemories, tools.readAllMemories, tools.readConsolidationHistory],
 };
 
+interface SpecialistResult {
+  text: string;
+  toolsCalled: Set<string>;
+}
+
 export class MemoryAgent {
-  /** Run one specialist with a message and return the final text response. */
+  // Hashes currently being ingested — prevents concurrent identical ingests
+  private readonly inFlight = new Set<string>();
+
+  constructor(private readonly decay?: DecayOptions) {}
+
+  /** Run one specialist and return the final text + which tools it called. */
   private async runSpecialist(
     specialist: Specialist,
     content: string | BetaContentBlockParam[],
-  ): Promise<string> {
+  ): Promise<SpecialistResult> {
     const started = Date.now();
     const runner = client.beta.messages.toolRunner({
       model: MODEL,
@@ -161,6 +247,7 @@ export class MemoryAgent {
     });
 
     let text = "";
+    const toolsCalled = new Set<string>();
     let turns = 0;
     let inputTokens = 0;
     let outputTokens = 0;
@@ -171,6 +258,9 @@ export class MemoryAgent {
         (message.usage.cache_read_input_tokens ?? 0) +
         (message.usage.cache_creation_input_tokens ?? 0);
       outputTokens += message.usage.output_tokens;
+      for (const block of message.content) {
+        if (block.type === "tool_use") toolsCalled.add(block.name);
+      }
       text = message.content
         .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
         .map((b) => b.text)
@@ -183,40 +273,50 @@ export class MemoryAgent {
       `[${time()}] 💰 ${specialist.name}: ${turns} turns, ${seconds}s, ` +
         `${inputTokens} in / ${outputTokens} out tokens, ~$${estCost.toFixed(4)}`,
     );
-    return text;
+    return { text, toolsCalled };
   }
 
   /**
-   * Run the ingest agent inside the write mutex, with two guards:
-   * - Exact-duplicate fast path: identical input content (by SHA-256) is
-   *   skipped before any model call — re-drops and repeated posts are free.
-   * - Verification retry: a memory agent must not fail silently, so if
-   *   nothing was stored or updated, retry once with a firmer instruction.
-   *   (An update bumps no count, so compare the full stats.)
+   * Run the ingest agent with three guards:
+   * - Exact-duplicate fast path: identical input content (by SHA-256) —
+   *   whether already stored or currently in flight — is skipped before
+   *   any model call.
+   * - Verification retry: a memory agent must not fail silently, so if the
+   *   agent called neither store_memory nor update_memory, retry once with
+   *   a firmer instruction. (Tool-call tracking is concurrency-safe, unlike
+   *   comparing global stats.)
+   * - The gate bounds ingest concurrency and excludes consolidation.
    */
   private async runIngest(content: string | BetaContentBlockParam[], hash: string): Promise<string> {
-    return writeMutex.run(async () => {
-      if (hasIngestHash(hash)) {
-        console.log(`[${time()}] ⏭️  Skipping ingest — identical content already ingested`);
-        return "Skipped: identical content was already ingested.";
-      }
-      const statsBefore = JSON.stringify(getMemoryStats());
-      let result = await this.runSpecialist(INGEST_AGENT, content);
-      if (JSON.stringify(getMemoryStats()) === statsBefore) {
-        console.warn(`[${time()}] ⚠️  Ingest did not store or update a memory — retrying once`);
-        const retry: BetaContentBlockParam[] = [
-          { type: "text", text: "You MUST call store_memory (or update_memory) for the following content." },
-          ...(typeof content === "string" ? [{ type: "text" as const, text: content }] : content),
-        ];
-        result = await this.runSpecialist(INGEST_AGENT, retry);
-      }
-      // Record the hash only when something was actually written, so a
-      // failed ingest stays retryable
-      if (JSON.stringify(getMemoryStats()) !== statsBefore) {
-        recordIngestHash(hash);
-      }
-      return result;
-    });
+    if (hasIngestHash(hash) || this.inFlight.has(hash)) {
+      console.log(`[${time()}] ⏭️  Skipping ingest — identical content already ingested`);
+      return "Skipped: identical content was already ingested.";
+    }
+    this.inFlight.add(hash);
+    try {
+      return await gate.runShared(async () => {
+        const wrote = (r: SpecialistResult) =>
+          r.toolsCalled.has("store_memory") || r.toolsCalled.has("update_memory");
+
+        let result = await this.runSpecialist(INGEST_AGENT, content);
+        if (!wrote(result)) {
+          console.warn(`[${time()}] ⚠️  Ingest did not store or update a memory — retrying once`);
+          const retry: BetaContentBlockParam[] = [
+            { type: "text", text: "You MUST call store_memory (or update_memory) for the following content." },
+            ...(typeof content === "string" ? [{ type: "text" as const, text: content }] : content),
+          ];
+          result = await this.runSpecialist(INGEST_AGENT, retry);
+        }
+        // Record the hash only when something was actually written, so a
+        // failed ingest stays retryable
+        if (wrote(result)) {
+          recordIngestHash(hash);
+        }
+        return result.text;
+      });
+    } finally {
+      this.inFlight.delete(hash);
+    }
   }
 
   async ingest(text: string, source = ""): Promise<string> {
@@ -270,16 +370,50 @@ export class MemoryAgent {
     );
   }
 
+  /**
+   * One full consolidation cycle, run with exclusive access:
+   * 1. Consolidate unconsolidated memories into an insight
+   * 2. When enough insights have accumulated, roll them up into a
+   *    higher-level insight (hierarchical consolidation)
+   * 3. Archive decayed memories (importance fades with age; the essence
+   *    survives in the insights)
+   */
   async consolidate(): Promise<string> {
-    return writeMutex.run(() =>
-      this.runSpecialist(
-        CONSOLIDATE_AGENT,
-        "Consolidate unconsolidated memories. Find connections and patterns.",
-      ),
-    );
+    const decay = this.decay;
+    return gate.runExclusive(async () => {
+      const parts: string[] = [];
+
+      if (getMemoryStats().unconsolidated >= 2) {
+        const result = await this.runSpecialist(
+          CONSOLIDATE_AGENT,
+          "Consolidate unconsolidated memories. Find connections and patterns.",
+        );
+        parts.push(result.text);
+      } else {
+        parts.push("Nothing to consolidate (fewer than 2 unconsolidated memories).");
+      }
+
+      if (readUnconsolidatedConsolidations().count >= META_CONSOLIDATION_MIN) {
+        const result = await this.runSpecialist(
+          META_CONSOLIDATE_AGENT,
+          "Roll the pending insights up into one higher-level insight.",
+        );
+        parts.push(result.text);
+      }
+
+      if (decay) {
+        const archived = archiveDecayedMemories(decay.halfLifeDays, decay.threshold);
+        if (archived > 0) {
+          parts.push(`Archived ${archived} decayed memories.`);
+        }
+      }
+
+      return parts.join("\n\n");
+    });
   }
 
   async query(question: string): Promise<string> {
-    return this.runSpecialist(QUERY_AGENT, `Based on my memories, answer: ${question}`);
+    const result = await this.runSpecialist(QUERY_AGENT, `Based on my memories, answer: ${question}`);
+    return result.text;
   }
 }
