@@ -1,0 +1,37 @@
+name: Always On Memory Agent (Claude)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "partner-models/claude/always-on-memory-agent/**"
+  push:
+    branches: [main]
+    paths:
+      - "partner-models/claude/always-on-memory-agent/**"
+
+jobs:
+  test:
+    name: Typecheck and Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: partner-models/claude/always-on-memory-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: partner-models/claude/always-on-memory-agent/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Tests run fully offline — the agent tests use a stub Messages API
+      - name: Test
+        run: npm test
