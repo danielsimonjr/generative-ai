@@ -17,20 +17,20 @@
 import { parseArgs } from "node:util";
 
 import { MemoryAgent, MODEL } from "./agent.js";
-import { setting } from "./config.js";
+import { requireSetting } from "./config.js";
 import { DB_PATH, getDb, time } from "./db.js";
 import { buildServer } from "./server.js";
 import { startWatcher } from "./watcher.js";
 
 const { values } = parseArgs({
   options: {
-    watch: { type: "string", default: setting("MEMORY_INBOX", "memory.inbox", "./inbox") },
+    watch: { type: "string" },
     port: { type: "string", default: "8888" },
     "consolidate-every": { type: "string", default: "30" },
   },
 });
 
-const watchDir = values.watch!;
+const watchDir = values.watch ?? requireSetting("MEMORY_INBOX", "memory.inbox");
 const port = Number(values.port);
 const consolidateEveryMin = Number(values["consolidate-every"]);
 
