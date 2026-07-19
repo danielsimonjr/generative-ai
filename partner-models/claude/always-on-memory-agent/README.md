@@ -160,21 +160,62 @@ npm start -- [options]
 
 ## Configuration
 
-The database and inbox locations can be set in `config.ini` in the project root:
+### The `config.ini` file
+
+The agent reads an optional `config.ini` from the directory it is started in (the project root when using `npm start`). The shipped file has every setting commented out — uncomment a line to change it:
 
 ```ini
+; Always On Memory Agent configuration
+
 [memory]
+; Path to the SQLite database file (env: MEMORY_DB)
 db = /var/data/memory.db
+
+; Folder to watch for new files (env: MEMORY_INBOX, flag: --watch)
 inbox = /var/data/inbox
 ```
 
-Precedence for every setting: **CLI flag > environment variable > `config.ini` > default**. Point the `MEMORY_CONFIG` environment variable at a different path to load the INI file from somewhere else.
+**File format:**
 
-| Setting  | `config.ini` key | Env var        | Default            | Description                                    |
-| -------- | ---------------- | -------------- | ------------------ | ---------------------------------------------- |
-| Database | `[memory] db`    | `MEMORY_DB`    | `memory.db`        | Path to the SQLite database file               |
-| Inbox    | `[memory] inbox` | `MEMORY_INBOX` | `./inbox`          | Folder to watch (the `--watch` flag overrides) |
-| Model    | —                | `MODEL`        | `claude-haiku-4-5` | Claude model used by all agents                |
+- Settings live under the `[memory]` section as `key = value` pairs
+- Lines starting with `;` or `#` are comments; blank lines are ignored
+- Values may optionally be wrapped in single or double quotes (useful for paths containing `;` or `#`)
+- Section and key names are case-insensitive; unknown keys are ignored
+- A missing `config.ini` is not an error — environment variables and defaults apply
+
+**Settings:**
+
+| `[memory]` key | Env var        | Default     | Description |
+| -------------- | -------------- | ----------- | ----------- |
+| `db`           | `MEMORY_DB`    | `memory.db` | Path to the SQLite database file. Created automatically on first use, along with its three tables (`memories`, `consolidations`, `processed_files`). |
+| `inbox`        | `MEMORY_INBOX` | `./inbox`   | Folder watched for new files to ingest. Created automatically if it doesn't exist. |
+
+Relative paths are resolved against the directory the agent is started from.
+
+To load the INI file from somewhere other than the working directory, point the `MEMORY_CONFIG` environment variable at it:
+
+```bash
+MEMORY_CONFIG=/etc/memory-agent/config.ini npm start
+```
+
+### Precedence
+
+Every setting resolves in this order — the first source that provides a value wins:
+
+1. **CLI flag** (`--watch` for the inbox)
+2. **Environment variable** (`MEMORY_DB`, `MEMORY_INBOX`)
+3. **`config.ini`**
+4. **Built-in default**
+
+For example, with `inbox = /var/data/inbox` in `config.ini`, running `MEMORY_INBOX=/tmp/drop npm start` watches `/tmp/drop`, and adding `-- --watch ./local-inbox` watches `./local-inbox`.
+
+### Other environment variables
+
+| Variable | Default            | Description                     |
+| -------- | ------------------ | ------------------------------- |
+| `MODEL`  | `claude-haiku-4-5` | Claude model used by all agents |
+
+The Claude Agent SDK reads `ANTHROPIC_API_KEY` for authentication (see Quick Start).
 
 ## Project Structure
 
