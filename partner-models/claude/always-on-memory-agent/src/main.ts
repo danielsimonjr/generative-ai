@@ -17,13 +17,14 @@
 import { parseArgs } from "node:util";
 
 import { MemoryAgent, MODEL } from "./agent.js";
+import { setting } from "./config.js";
 import { DB_PATH, getDb, time } from "./db.js";
 import { buildServer } from "./server.js";
 import { startWatcher } from "./watcher.js";
 
 const { values } = parseArgs({
   options: {
-    watch: { type: "string", default: "./inbox" },
+    watch: { type: "string", default: setting("MEMORY_INBOX", "memory.inbox", "./inbox") },
     port: { type: "string", default: "8888" },
     "consolidate-every": { type: "string", default: "30" },
   },
