@@ -158,7 +158,13 @@ npm start -- [options]
   --consolidate-every MIN  Consolidation interval (default: 30)
 ```
 
-Environment variables: `MODEL` (default `claude-haiku-4-5`), `MEMORY_DB` (default `memory.db`).
+Environment variables:
+
+| Variable       | Default            | Description                                    |
+| -------------- | ------------------ | ---------------------------------------------- |
+| `MODEL`        | `claude-haiku-4-5` | Claude model used by all agents                |
+| `MEMORY_DB`    | `memory.db`        | Path to the SQLite database file               |
+| `MEMORY_INBOX` | `./inbox`          | Folder to watch (the `--watch` flag overrides) |
 
 ## Project Structure
 

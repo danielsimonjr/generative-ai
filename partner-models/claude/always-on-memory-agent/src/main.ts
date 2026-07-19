@@ -23,7 +23,7 @@ import { startWatcher } from "./watcher.js";
 
 const { values } = parseArgs({
   options: {
-    watch: { type: "string", default: "./inbox" },
+    watch: { type: "string", default: process.env.MEMORY_INBOX ?? "./inbox" },
     port: { type: "string", default: "8888" },
     "consolidate-every": { type: "string", default: "30" },
   },
