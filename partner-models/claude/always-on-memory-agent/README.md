@@ -158,13 +158,23 @@ npm start -- [options]
   --consolidate-every MIN  Consolidation interval (default: 30)
 ```
 
-Environment variables:
+## Configuration
 
-| Variable       | Default            | Description                                    |
-| -------------- | ------------------ | ---------------------------------------------- |
-| `MODEL`        | `claude-haiku-4-5` | Claude model used by all agents                |
-| `MEMORY_DB`    | `memory.db`        | Path to the SQLite database file               |
-| `MEMORY_INBOX` | `./inbox`          | Folder to watch (the `--watch` flag overrides) |
+The database and inbox locations can be set in `config.ini` in the project root:
+
+```ini
+[memory]
+db = /var/data/memory.db
+inbox = /var/data/inbox
+```
+
+Precedence for every setting: **CLI flag > environment variable > `config.ini` > default**. Point the `MEMORY_CONFIG` environment variable at a different path to load the INI file from somewhere else.
+
+| Setting  | `config.ini` key | Env var        | Default            | Description                                    |
+| -------- | ---------------- | -------------- | ------------------ | ---------------------------------------------- |
+| Database | `[memory] db`    | `MEMORY_DB`    | `memory.db`        | Path to the SQLite database file               |
+| Inbox    | `[memory] inbox` | `MEMORY_INBOX` | `./inbox`          | Folder to watch (the `--watch` flag overrides) |
+| Model    | —                | `MODEL`        | `claude-haiku-4-5` | Claude model used by all agents                |
 
 ## Project Structure
 
@@ -172,13 +182,15 @@ Environment variables:
 always-on-memory-agent/
 ├── src/
 │   ├── main.ts        # Entry point: watcher + timer + HTTP server
-│   ├── agent.ts       # Orchestrator + subagents (Claude Agent SDK)
+│   ├── agent.ts       # Specialist agents (Claude Agent SDK)
 │   ├── tools.ts       # Memory tools as an in-process MCP server
 │   ├── db.ts          # SQLite memory store (node:sqlite)
+│   ├── config.ts      # INI config loader (config.ini)
 │   ├── filetypes.ts   # Supported ingestion file types
 │   ├── watcher.ts     # Inbox folder watcher
 │   └── server.ts      # HTTP API
 ├── inbox/             # Drop files here for auto-ingestion
+├── config.ini         # Optional config (db + inbox paths)
 ├── package.json
 ├── tsconfig.json
 └── memory.db          # SQLite database (created automatically)

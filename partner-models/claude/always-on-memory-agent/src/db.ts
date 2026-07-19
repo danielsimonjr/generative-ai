@@ -7,7 +7,9 @@
  */
 import { DatabaseSync } from "node:sqlite";
 
-export const DB_PATH = process.env.MEMORY_DB ?? "memory.db";
+import { setting } from "./config.js";
+
+export const DB_PATH = setting("MEMORY_DB", "memory.db", "memory.db");
 
 let db: DatabaseSync | undefined;
 
