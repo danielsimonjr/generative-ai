@@ -1,7 +1,11 @@
 /**
  * HTTP API — same endpoints as the Python/aiohttp original, built on
- * Node's built-in http module.
+ * Node's built-in http module, plus a minimal dashboard at GET /.
+ *
+ * Binds 127.0.0.1 by default. When a token is configured, every API
+ * endpoint requires `Authorization: Bearer <token>`.
  */
+import { timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -14,6 +18,7 @@ import {
   readAllMemories,
   time,
 } from "./db.js";
+import { DASHBOARD_HTML } from "./dashboard.js";
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -30,10 +35,32 @@ async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, u
   }
 }
 
-export function buildServer(agent: MemoryAgent, watchPath: string): http.Server {
+function isAuthorized(req: http.IncomingMessage, token: string | undefined): boolean {
+  if (!token) return true;
+  const header = req.headers.authorization ?? "";
+  const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const a = Buffer.from(provided);
+  const b = Buffer.from(token);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+export function buildServer(
+  agent: MemoryAgent,
+  watchPath: string,
+  apiToken?: string,
+): http.Server {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const route = `${req.method} ${url.pathname}`;
+
+    // The dashboard page is static and holds no data; everything else is gated
+    if (route === "GET /") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(DASHBOARD_HTML);
+    }
+    if (!isAuthorized(req, apiToken)) {
+      return json(res, 401, { error: "unauthorized" });
+    }
 
     try {
       switch (route) {

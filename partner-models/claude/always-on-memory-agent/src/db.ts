@@ -38,9 +38,39 @@ export function getDb(): DatabaseSync {
       );
       CREATE TABLE IF NOT EXISTS processed_files (
         path TEXT PRIMARY KEY,
-        processed_at TEXT NOT NULL
+        processed_at TEXT NOT NULL,
+        mtime_ms REAL NOT NULL DEFAULT 0
       );
     `);
+    // Migrate databases created before the mtime_ms column existed
+    try {
+      db.exec("ALTER TABLE processed_files ADD COLUMN mtime_ms REAL NOT NULL DEFAULT 0");
+    } catch {
+      // column already exists
+    }
+    // Full-text index over memories, kept in sync by triggers
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+        summary, raw_text, entities, topics,
+        content='memories', content_rowid='id'
+      );
+      CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, summary, raw_text, entities, topics)
+        VALUES (new.id, new.summary, new.raw_text, new.entities, new.topics);
+      END;
+      CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, summary, raw_text, entities, topics)
+        VALUES ('delete', old.id, old.summary, old.raw_text, old.entities, old.topics);
+      END;
+      CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, summary, raw_text, entities, topics)
+        VALUES ('delete', old.id, old.summary, old.raw_text, old.entities, old.topics);
+        INSERT INTO memories_fts(rowid, summary, raw_text, entities, topics)
+        VALUES (new.id, new.summary, new.raw_text, new.entities, new.topics);
+      END;
+    `);
+    // Rebuild the index so databases from before the FTS table stay searchable
+    db.exec("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')");
   }
   return db;
 }
@@ -95,7 +125,12 @@ export function readAllMemories() {
   const rows = getDb()
     .prepare("SELECT * FROM memories ORDER BY created_at DESC LIMIT 50")
     .all() as Record<string, unknown>[];
-  const memories: Memory[] = rows.map((r) => ({
+  const memories = rows.map(rowToMemory);
+  return { memories, count: memories.length };
+}
+
+function rowToMemory(r: Record<string, unknown>): Memory {
+  return {
     id: r.id as number,
     source: r.source as string,
     summary: r.summary as string,
@@ -105,8 +140,57 @@ export function readAllMemories() {
     connections: JSON.parse(r.connections as string),
     created_at: r.created_at as string,
     consolidated: Boolean(r.consolidated),
-  }));
+  };
+}
+
+/** Full-text search over summaries, raw text, entities, and topics. */
+export function searchMemories(searchQuery: string, limit = 10) {
+  // Quote each term so user text can't break FTS5 query syntax; OR them
+  // together for recall — bm25 ranking sorts the best matches first.
+  const terms = searchQuery
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((t) => `"${t.replaceAll('"', '""')}"`);
+  if (terms.length === 0) return { memories: [], count: 0 };
+  const rows = getDb()
+    .prepare(
+      `SELECT m.* FROM memories_fts f JOIN memories m ON m.id = f.rowid
+       WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?`,
+    )
+    .all(terms.join(" OR "), limit) as Record<string, unknown>[];
+  const memories = rows.map(rowToMemory);
   return { memories, count: memories.length };
+}
+
+/** Update an existing memory in place (dedup / correction). */
+export function updateMemory(args: {
+  memory_id: number;
+  raw_text?: string;
+  summary?: string;
+  entities?: string[];
+  topics?: string[];
+  importance?: number;
+}) {
+  const database = getDb();
+  const row = database.prepare("SELECT 1 FROM memories WHERE id = ?").get(args.memory_id);
+  if (!row) {
+    return { status: "not_found", memory_id: args.memory_id };
+  }
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (args.raw_text !== undefined) (sets.push("raw_text = ?"), params.push(args.raw_text));
+  if (args.summary !== undefined) (sets.push("summary = ?"), params.push(args.summary));
+  if (args.entities !== undefined) (sets.push("entities = ?"), params.push(JSON.stringify(args.entities)));
+  if (args.topics !== undefined) (sets.push("topics = ?"), params.push(JSON.stringify(args.topics)));
+  if (args.importance !== undefined) (sets.push("importance = ?"), params.push(args.importance));
+  if (sets.length === 0) {
+    return { status: "no_changes", memory_id: args.memory_id };
+  }
+  // Content changed — surface it to the next consolidation cycle again
+  sets.push("consolidated = 0");
+  database.prepare(`UPDATE memories SET ${sets.join(", ")} WHERE id = ?`).run(...params, args.memory_id);
+  console.log(`[${time()}] ✏️  Updated memory #${args.memory_id}`);
+  return { status: "updated", memory_id: args.memory_id };
 }
 
 export function readUnconsolidatedMemories() {
@@ -205,14 +289,18 @@ export function deleteMemory(memoryId: number) {
   return { status: "deleted", memory_id: memoryId };
 }
 
-export function isFileProcessed(path: string): boolean {
-  return Boolean(getDb().prepare("SELECT 1 FROM processed_files WHERE path = ?").get(path));
+/** A file needs (re-)ingestion when unseen or modified since last processed. */
+export function isFileProcessed(path: string, mtimeMs: number): boolean {
+  const row = getDb()
+    .prepare("SELECT mtime_ms FROM processed_files WHERE path = ?")
+    .get(path) as { mtime_ms: number } | undefined;
+  return row !== undefined && row.mtime_ms >= mtimeMs;
 }
 
-export function markFileProcessed(path: string): void {
+export function markFileProcessed(path: string, mtimeMs: number): void {
   getDb()
-    .prepare("INSERT OR REPLACE INTO processed_files (path, processed_at) VALUES (?, ?)")
-    .run(path, new Date().toISOString());
+    .prepare("INSERT OR REPLACE INTO processed_files (path, processed_at, mtime_ms) VALUES (?, ?, ?)")
+    .run(path, new Date().toISOString(), mtimeMs);
 }
 
 export function clearAllMemories() {

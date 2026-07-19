@@ -22,9 +22,11 @@ The Google ADK concepts map directly onto the Claude Agent SDK:
 
 Three specialist agents share one SQLite memory store, exposed to them as an in-process MCP server:
 
-- **ingest-agent** — extracts summary, entities, topics, and importance from new input, then calls `store_memory` (with a verification retry so ingestion never fails silently)
+- **ingest-agent** — extracts summary, entities, topics, and importance from new input, then searches for closely related existing memories: duplicates and corrections **update the existing memory in place** (`update_memory`); genuinely new information is stored (`store_memory`). A verification retry ensures ingestion never fails silently.
 - **consolidate-agent** — periodically reviews unconsolidated memories, finds connections, and stores cross-cutting insights
-- **query-agent** — answers questions from stored memories with `[Memory N]` citations
+- **query-agent** — retrieves memories via **full-text search** (SQLite FTS5) and answers with `[Memory N]` citations. Search-based retrieval scales to large memory stores instead of loading everything into context.
+
+Every operation logs its turn count, duration, and cost, so you can watch what 24/7 operation actually costs.
 
 Each specialist is a scoped `query()` call: its own system prompt, its own tool allowlist (`allowedTools`), same shared memory server. The original used an LLM orchestrator with `sub_agents` to route requests; here every entry point (file watcher, HTTP endpoint, consolidation timer) already knows its intent, so routing happens in code — one less model hop per request, which matters for an agent that runs 24/7. (The Agent SDK's subagent mechanism also currently runs subagents as background tasks and does not expose in-process SDK MCP servers to them, which rules out a faithful `Task`-tool orchestrator for this design.)
 
@@ -58,10 +60,13 @@ Input: "Anthropic reports 62% of Claude usage is code-related.
 
 > **Note:** unlike the Gemini original, audio and video files are not supported — Claude models do not process audio or video input. Media files are ingested via the SDK's built-in `Read` tool rather than inline bytes.
 
-**Two ways to ingest:**
+Before storing, the ingest agent searches existing memories: if the new input duplicates or corrects something already stored (e.g. "the launch slipped from March 15 to April 1"), it updates that memory in place instead of creating a near-duplicate. Updated memories are re-queued for consolidation. Modified inbox files are re-ingested automatically (the watcher tracks modification times).
 
-- **File watcher**: drop a supported file in the `./inbox` folder — the agent picks it up within ~5 seconds
+**Three ways to ingest:**
+
+- **File watcher**: drop a supported file in the inbox folder — the agent picks it up within ~5 seconds
 - **HTTP API**: `POST /ingest` with text content
+- **Dashboard**: the built-in web UI at `http://127.0.0.1:8888/`
 
 ### 2. Consolidate
 
@@ -140,6 +145,7 @@ curl "http://localhost:8888/query?q=what+do+you+know"
 
 | Endpoint       | Method | Description                                     |
 | -------------- | ------ | ----------------------------------------------- |
+| `/`            | GET    | Web dashboard (ingest, query, browse, delete)   |
 | `/status`      | GET    | Memory statistics (counts)                      |
 | `/memories`    | GET    | List all stored memories                        |
 | `/ingest`      | POST   | Ingest new text (`{"text": "...", "source": "..."}`) |
@@ -193,6 +199,13 @@ Relative paths are resolved against the directory the agent is started from.
 
 If a setting is missing everywhere — not in `config.ini`, not in the environment, and (for the inbox) no `--watch` flag — the agent exits at startup with a message naming the missing key.
 
+**Server settings** (optional, under `[server]`):
+
+| `[server]` key | Env var            | Default     | Description |
+| -------------- | ------------------ | ----------- | ----------- |
+| `host`         | `MEMORY_HOST`      | `127.0.0.1` | Interface the HTTP API binds to. Set `0.0.0.0` to expose on the network — configure a token if you do. |
+| `token`        | `MEMORY_API_TOKEN` | *(unset)*   | When set, every API request must send `Authorization: Bearer <token>`. The dashboard page itself loads without auth (it holds no data) and has a token field. |
+
 To load the INI file from somewhere other than the working directory, point the `MEMORY_CONFIG` environment variable at it:
 
 ```bash
@@ -217,6 +230,19 @@ For example, with `inbox = /var/data/inbox` in `config.ini`, running `MEMORY_INB
 
 The Claude Agent SDK reads `ANTHROPIC_API_KEY` for authentication (see Quick Start).
 
+## Security Notes
+
+- The HTTP API binds `127.0.0.1` by default and supports bearer-token auth (see Server settings above) — turn the token on before exposing it beyond localhost.
+- The ingest agent's `Read` tool is granted per file-ingestion call only and is confined to the inbox directory, so a malicious dropped file can't instruct the agent to read elsewhere on disk.
+- Everything else the agents can do goes through the memory MCP tools, which only touch the SQLite database.
+
+## Tests
+
+```bash
+npm test        # unit tests for the memory store and INI parser (node:test)
+npm run typecheck
+```
+
 ## Project Structure
 
 ```
@@ -225,11 +251,13 @@ always-on-memory-agent/
 │   ├── main.ts        # Entry point: watcher + timer + HTTP server
 │   ├── agent.ts       # Specialist agents (Claude Agent SDK)
 │   ├── tools.ts       # Memory tools as an in-process MCP server
-│   ├── db.ts          # SQLite memory store (node:sqlite)
+│   ├── db.ts          # SQLite memory store + FTS5 search (node:sqlite)
 │   ├── config.ts      # INI config loader (config.ini)
+│   ├── dashboard.ts   # Single-page web dashboard (served at GET /)
 │   ├── filetypes.ts   # Supported ingestion file types
-│   ├── watcher.ts     # Inbox folder watcher
-│   └── server.ts      # HTTP API
+│   ├── watcher.ts     # Inbox folder watcher (mtime-aware)
+│   └── server.ts      # HTTP API + auth
+├── test/              # Unit tests (node:test)
 ├── inbox/             # Drop files here for auto-ingestion
 ├── config.ini         # Config: db + inbox paths (canonical source)
 ├── package.json

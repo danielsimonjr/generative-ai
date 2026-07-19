@@ -28,6 +28,34 @@ const storeMemory = tool(
   async (args) => jsonResult(db.storeMemory(args)),
 );
 
+const searchMemories = tool(
+  "search_memories",
+  "Full-text search over stored memories (summaries, content, entities, topics). " +
+    "Call this to find memories relevant to a question, or to check whether " +
+    "information is already stored before creating a new memory.",
+  {
+    query: z.string().describe("Search terms — key words, entity names, or topics"),
+    limit: z.number().int().min(1).max(25).optional().describe("Max results (default 10)"),
+  },
+  async (args) => jsonResult(db.searchMemories(args.query, args.limit ?? 10)),
+);
+
+const updateMemory = tool(
+  "update_memory",
+  "Update an existing memory in place. Use this instead of store_memory when new " +
+    "information duplicates or corrects an already-stored memory. Only the fields " +
+    "you pass are changed; the memory is re-queued for consolidation.",
+  {
+    memory_id: z.number().int().describe("ID of the memory to update"),
+    raw_text: z.string().optional().describe("Replacement full content"),
+    summary: z.string().optional().describe("Replacement 1-2 sentence summary"),
+    entities: z.array(z.string()).optional().describe("Replacement entity list"),
+    topics: z.array(z.string()).optional().describe("Replacement topic tags"),
+    importance: z.number().min(0).max(1).optional().describe("Replacement importance"),
+  },
+  async (args) => jsonResult(db.updateMemory(args)),
+);
+
 const readAllMemories = tool(
   "read_all_memories",
   "Read all stored memories from the database, most recent first.",
@@ -81,6 +109,8 @@ export const memoryServer = createSdkMcpServer({
   version: "1.0.0",
   tools: [
     storeMemory,
+    searchMemories,
+    updateMemory,
     readAllMemories,
     readUnconsolidatedMemories,
     storeConsolidation,

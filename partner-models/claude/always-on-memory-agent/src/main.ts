@@ -17,7 +17,7 @@
 import { parseArgs } from "node:util";
 
 import { MemoryAgent, MODEL } from "./agent.js";
-import { requireSetting } from "./config.js";
+import { requireSetting, setting } from "./config.js";
 import { DB_PATH, getDb, time } from "./db.js";
 import { buildServer } from "./server.js";
 import { startWatcher } from "./watcher.js";
@@ -33,15 +33,17 @@ const { values } = parseArgs({
 const watchDir = values.watch ?? requireSetting("MEMORY_INBOX", "memory.inbox");
 const port = Number(values.port);
 const consolidateEveryMin = Number(values["consolidate-every"]);
+const host = setting("MEMORY_HOST", "server.host") ?? "127.0.0.1";
+const apiToken = setting("MEMORY_API_TOKEN", "server.token");
 
-const agent = new MemoryAgent();
+const agent = new MemoryAgent(watchDir);
 
 console.log(`[${time()}] 🧠 Agent Memory Layer starting`);
 console.log(`   Model: ${MODEL}`);
 console.log(`   Database: ${DB_PATH}`);
 console.log(`   Watch: ${watchDir}`);
 console.log(`   Consolidate: every ${consolidateEveryMin}m`);
-console.log(`   API: http://localhost:${port}`);
+console.log(`   API: http://${host}:${port}  (auth: ${apiToken ? "bearer token" : "none"})`);
 console.log("");
 
 // File watcher
@@ -69,11 +71,11 @@ const consolidationTimer = setInterval(
   consolidateEveryMin * 60 * 1000,
 );
 
-// HTTP API
-const server = buildServer(agent, watchDir);
-server.listen(port, () => {
+// HTTP API + dashboard
+const server = buildServer(agent, watchDir, apiToken);
+server.listen(port, host, () => {
   console.log(
-    `[${time()}] ✅ Agent running. Drop files in ${watchDir}/ or POST to http://localhost:${port}/ingest`,
+    `[${time()}] ✅ Agent running. Drop files in ${watchDir}/ or open http://${host}:${port}/`,
   );
   console.log("   Supported: text, images, PDFs");
   console.log("");
