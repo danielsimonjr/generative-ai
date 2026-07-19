@@ -1,28 +1,49 @@
 /**
  * The memory agents: three specialists (ingest, consolidate, query), all
- * running on Claude Haiku and sharing one in-process MCP memory server.
+ * running on Claude Haiku via the Anthropic SDK's tool runner.
  *
- * The Google ADK original used an LLM orchestrator with sub_agents to route
- * requests. In this port, routing is deterministic in code — every entry
- * point (file watcher, HTTP endpoint, consolidation timer) already knows
- * which specialist it needs, so each operation runs as a single scoped
- * `query()` call with that specialist's system prompt and tool allowlist.
- * This is cheaper (no routing hop) and more reliable for a 24/7 background
- * process.
+ * Each operation is a single scoped tool-runner call with that specialist's
+ * system prompt and tools — no orchestrator hop, no subprocess. Media files
+ * (images, PDFs) are sent inline as base64 content blocks, so the agents
+ * have no filesystem access at all.
  */
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import Anthropic from "@anthropic-ai/sdk";
+import type { BetaContentBlockParam } from "@anthropic-ai/sdk/resources/beta";
+import type { BetaRunnableTool } from "@anthropic-ai/sdk/lib/tools/BetaRunnableTool";
+import fs from "node:fs";
 import path from "node:path";
 
 import { getMemoryStats, time } from "./db.js";
 import { MEDIA_EXTENSIONS } from "./filetypes.js";
-import { memoryServer } from "./tools.js";
+import * as tools from "./tools.js";
 
 export const MODEL = process.env.MODEL ?? "claude-haiku-4-5";
+
+// Claude Haiku 4.5 pricing, USD per token — for the per-operation cost log
+const INPUT_PRICE = 1 / 1e6;
+const OUTPUT_PRICE = 5 / 1e6;
+
+const MAX_MEDIA_BYTES = 20 * 1024 * 1024; // stay under the 32MB request limit after base64
+
+function makeClient(): Anthropic {
+  try {
+    return new Anthropic({ maxRetries: 3 });
+  } catch {
+    console.error(
+      "Missing Anthropic credentials: set the ANTHROPIC_API_KEY environment " +
+        "variable (get a key at https://platform.claude.com/).",
+    );
+    process.exit(1);
+  }
+}
+
+const client = makeClient();
 
 interface Specialist {
   name: string;
   prompt: string;
-  tools: string[];
+  // Tools are typed per-input, so a mixed list is a heterogeneous array
+  tools: BetaRunnableTool<any>[];
 }
 
 const INGEST_AGENT: Specialist = {
@@ -47,16 +68,14 @@ const INGEST_AGENT: Specialist = {
     "     memory with the merged, corrected content",
     "   - Otherwise call store_memory to create a new memory",
     "",
-    "If given a file path, use the Read tool to read it first. For images:",
-    "describe the scene, objects, text, people, and any visual details. For",
-    "PDFs: extract and summarize the document content (read long PDFs in",
-    "page ranges).",
+    "For images: describe the scene, objects, text, people, and any visual",
+    "details. For PDF documents: extract and summarize the content.",
     "",
     "Use the full description as raw_text so the context is preserved.",
     "Always call store_memory or update_memory — exactly one of them.",
     "After storing, confirm in one sentence what was stored or updated.",
   ].join("\n"),
-  tools: ["mcp__memory__search_memories", "mcp__memory__store_memory", "mcp__memory__update_memory"],
+  tools: [tools.searchMemories, tools.storeMemory, tools.updateMemory],
 };
 
 const CONSOLIDATE_AGENT: Specialist = {
@@ -72,7 +91,7 @@ const CONSOLIDATE_AGENT: Specialist = {
     "Connections: a list of objects with from_id, to_id, and relationship keys.",
     "Think deeply about cross-cutting patterns.",
   ].join("\n"),
-  tools: ["mcp__memory__read_unconsolidated_memories", "mcp__memory__store_consolidation"],
+  tools: [tools.readUnconsolidatedMemories, tools.storeConsolidation],
 };
 
 const QUERY_AGENT: Specialist = {
@@ -97,47 +116,49 @@ const QUERY_AGENT: Specialist = {
     "",
     "Be thorough but concise. Always cite sources.",
   ].join("\n"),
-  tools: [
-    "mcp__memory__search_memories",
-    "mcp__memory__read_all_memories",
-    "mcp__memory__read_consolidation_history",
-  ],
+  tools: [tools.searchMemories, tools.readAllMemories, tools.readConsolidationHistory],
 };
 
 export class MemoryAgent {
-  constructor(private readonly inboxDir: string) {}
-
   /** Run one specialist with a message and return the final text response. */
   private async runSpecialist(
     specialist: Specialist,
-    message: string,
-    extra: { cwd?: string; extraTools?: string[] } = {},
+    content: string | BetaContentBlockParam[],
   ): Promise<string> {
-    let result = "";
-    for await (const sdkMessage of query({
-      prompt: message,
-      options: {
-        model: MODEL,
-        systemPrompt: specialist.prompt,
-        mcpServers: { memory: memoryServer },
-        allowedTools: [...specialist.tools, ...(extra.extraTools ?? [])],
-        permissionMode: "dontAsk",
-        settingSources: [],
-        maxTurns: 12,
-        ...(extra.cwd ? { cwd: extra.cwd } : {}),
-      },
-    })) {
-      if (sdkMessage.type === "result") {
-        const cost = sdkMessage.total_cost_usd;
-        const seconds = (sdkMessage.duration_ms / 1000).toFixed(1);
-        console.log(
-          `[${time()}] 💰 ${specialist.name}: ${sdkMessage.num_turns} turns, ${seconds}s` +
-            (cost != null ? `, $${cost.toFixed(4)}` : ""),
-        );
-        result = sdkMessage.subtype === "success" ? sdkMessage.result : `Error: ${sdkMessage.subtype}`;
-      }
+    const started = Date.now();
+    const runner = client.beta.messages.toolRunner({
+      model: MODEL,
+      max_tokens: 16000,
+      system: specialist.prompt,
+      tools: specialist.tools,
+      messages: [{ role: "user", content }],
+      max_iterations: 12,
+    });
+
+    let text = "";
+    let turns = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    for await (const message of runner) {
+      turns++;
+      inputTokens +=
+        message.usage.input_tokens +
+        (message.usage.cache_read_input_tokens ?? 0) +
+        (message.usage.cache_creation_input_tokens ?? 0);
+      outputTokens += message.usage.output_tokens;
+      text = message.content
+        .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("");
     }
-    return result;
+
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    const estCost = inputTokens * INPUT_PRICE + outputTokens * OUTPUT_PRICE;
+    console.log(
+      `[${time()}] 💰 ${specialist.name}: ${turns} turns, ${seconds}s, ` +
+        `${inputTokens} in / ${outputTokens} out tokens, ~$${estCost.toFixed(4)}`,
+    );
+    return text;
   }
 
   /**
@@ -145,16 +166,16 @@ export class MemoryAgent {
    * a memory agent must not fail silently. Retries once with a firmer
    * instruction. (An update bumps no count, so compare the full stats.)
    */
-  private async runIngest(message: string, extra: { cwd?: string; extraTools?: string[] } = {}): Promise<string> {
+  private async runIngest(content: string | BetaContentBlockParam[]): Promise<string> {
     const statsBefore = JSON.stringify(getMemoryStats());
-    let result = await this.runSpecialist(INGEST_AGENT, message, extra);
+    let result = await this.runSpecialist(INGEST_AGENT, content);
     if (JSON.stringify(getMemoryStats()) === statsBefore) {
       console.warn(`[${time()}] ⚠️  Ingest did not store or update a memory — retrying once`);
-      result = await this.runSpecialist(
-        INGEST_AGENT,
-        `You MUST call store_memory (or update_memory) for the following content.\n\n${message}`,
-        extra,
-      );
+      const retry: BetaContentBlockParam[] = [
+        { type: "text", text: "You MUST call store_memory (or update_memory) for the following content." },
+        ...(typeof content === "string" ? [{ type: "text" as const, text: content }] : content),
+      ];
+      result = await this.runSpecialist(INGEST_AGENT, retry);
     }
     return result;
   }
@@ -166,23 +187,45 @@ export class MemoryAgent {
     return this.runIngest(msg);
   }
 
-  /**
-   * Ingest a media file (image or PDF) by having the agent Read it. The Read
-   * tool is granted for this call only, restricted to the inbox directory —
-   * a malicious file can't instruct the agent to read elsewhere on disk.
-   */
+  /** Ingest a media file (image or PDF) as inline base64 content blocks. */
   async ingestFile(filePath: string): Promise<string> {
     const absPath = path.resolve(filePath);
     const name = path.basename(absPath);
-    const mimeType = MEDIA_EXTENSIONS[path.extname(absPath).toLowerCase()] ?? "application/octet-stream";
+    const ext = path.extname(absPath).toLowerCase();
+    const mimeType = MEDIA_EXTENSIONS[ext] ?? "application/octet-stream";
     const kind = mimeType.split("/")[0];
+
+    const bytes = fs.readFileSync(absPath);
+    if (bytes.length > MAX_MEDIA_BYTES) {
+      const sizeMb = (bytes.length / (1024 * 1024)).toFixed(1);
+      console.warn(`[${time()}] ⚠️  Skipping ${name} (${sizeMb}MB) — exceeds 20MB limit`);
+      return `Skipped: file too large (${sizeMb}MB)`;
+    }
+    const data = bytes.toString("base64");
+
+    const mediaBlock: BetaContentBlockParam =
+      ext === ".pdf"
+        ? { type: "document", source: { type: "base64", media_type: "application/pdf", data } }
+        : {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: mimeType as "image/png" | "image/jpeg" | "image/gif" | "image/webp",
+              data,
+            },
+          };
+
     console.log(`[${time()}] 🔮 Ingesting ${kind}: ${name}`);
-    return this.runIngest(
-      `Remember this file (source: ${name}, type: ${mimeType}).\n\n` +
-        `Read the file at ${absPath}, thoroughly analyze its content, and ` +
-        `extract all meaningful information for memory storage.`,
-      { cwd: path.resolve(this.inboxDir), extraTools: ["Read(./**)"] },
-    );
+    return this.runIngest([
+      mediaBlock,
+      {
+        type: "text",
+        text:
+          `Remember this file (source: ${name}, type: ${mimeType}). ` +
+          `Thoroughly analyze its content and extract all meaningful ` +
+          `information for memory storage.`,
+      },
+    ]);
   }
 
   async consolidate(): Promise<string> {

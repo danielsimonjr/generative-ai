@@ -1,79 +1,80 @@
 /**
- * Custom memory tools exposed to the agents as an in-process MCP server.
+ * Memory tools for the Anthropic SDK tool runner.
  *
  * Each tool wraps a synchronous SQLite operation from db.ts and returns its
- * result as JSON text. Tool names surface to the agents as
- * `mcp__memory__<tool_name>`.
+ * result as JSON text. The tool runner executes the `run` function in-process
+ * and feeds the result back to the model automatically.
  */
-import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
+import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 
 import * as db from "./db.js";
 
-function jsonResult(data: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
-}
+const jsonText = (data: unknown) => JSON.stringify(data);
 
-const storeMemory = tool(
-  "store_memory",
-  "Store a processed memory in the database. Call this after extracting structure from new information.",
-  {
+export const storeMemory = betaZodTool({
+  name: "store_memory",
+  description:
+    "Store a processed memory in the database. Call this after extracting structure from new information.",
+  inputSchema: z.object({
     raw_text: z.string().describe("The original input text or full content description"),
     summary: z.string().describe("A concise 1-2 sentence summary"),
     entities: z.array(z.string()).describe("Key people, companies, products, or concepts"),
     topics: z.array(z.string()).describe("2-4 topic tags"),
     importance: z.number().min(0).max(1).describe("Importance from 0.0 to 1.0"),
     source: z.string().optional().describe("Where this memory came from (filename, URL, etc.)"),
-  },
-  async (args) => jsonResult(db.storeMemory(args)),
-);
+  }),
+  run: async (input) => jsonText(db.storeMemory(input)),
+});
 
-const searchMemories = tool(
-  "search_memories",
-  "Full-text search over stored memories (summaries, content, entities, topics). " +
+export const searchMemories = betaZodTool({
+  name: "search_memories",
+  description:
+    "Full-text search over stored memories (summaries, content, entities, topics). " +
     "Call this to find memories relevant to a question, or to check whether " +
     "information is already stored before creating a new memory.",
-  {
+  inputSchema: z.object({
     query: z.string().describe("Search terms — key words, entity names, or topics"),
     limit: z.number().int().min(1).max(25).optional().describe("Max results (default 10)"),
-  },
-  async (args) => jsonResult(db.searchMemories(args.query, args.limit ?? 10)),
-);
+  }),
+  run: async (input) => jsonText(db.searchMemories(input.query, input.limit ?? 10)),
+});
 
-const updateMemory = tool(
-  "update_memory",
-  "Update an existing memory in place. Use this instead of store_memory when new " +
+export const updateMemory = betaZodTool({
+  name: "update_memory",
+  description:
+    "Update an existing memory in place. Use this instead of store_memory when new " +
     "information duplicates or corrects an already-stored memory. Only the fields " +
     "you pass are changed; the memory is re-queued for consolidation.",
-  {
+  inputSchema: z.object({
     memory_id: z.number().int().describe("ID of the memory to update"),
     raw_text: z.string().optional().describe("Replacement full content"),
     summary: z.string().optional().describe("Replacement 1-2 sentence summary"),
     entities: z.array(z.string()).optional().describe("Replacement entity list"),
     topics: z.array(z.string()).optional().describe("Replacement topic tags"),
     importance: z.number().min(0).max(1).optional().describe("Replacement importance"),
-  },
-  async (args) => jsonResult(db.updateMemory(args)),
-);
+  }),
+  run: async (input) => jsonText(db.updateMemory(input)),
+});
 
-const readAllMemories = tool(
-  "read_all_memories",
-  "Read all stored memories from the database, most recent first.",
-  {},
-  async () => jsonResult(db.readAllMemories()),
-);
+export const readAllMemories = betaZodTool({
+  name: "read_all_memories",
+  description: "Read all stored memories from the database, most recent first.",
+  inputSchema: z.object({}),
+  run: async () => jsonText(db.readAllMemories()),
+});
 
-const readUnconsolidatedMemories = tool(
-  "read_unconsolidated_memories",
-  "Read memories that haven't been consolidated yet.",
-  {},
-  async () => jsonResult(db.readUnconsolidatedMemories()),
-);
+export const readUnconsolidatedMemories = betaZodTool({
+  name: "read_unconsolidated_memories",
+  description: "Read memories that haven't been consolidated yet.",
+  inputSchema: z.object({}),
+  run: async () => jsonText(db.readUnconsolidatedMemories()),
+});
 
-const storeConsolidation = tool(
-  "store_consolidation",
-  "Store a consolidation result and mark source memories as consolidated.",
-  {
+export const storeConsolidation = betaZodTool({
+  name: "store_consolidation",
+  description: "Store a consolidation result and mark source memories as consolidated.",
+  inputSchema: z.object({
     source_ids: z.array(z.number().int()).describe("Memory IDs that were consolidated"),
     summary: z.string().describe("A synthesized summary across all source memories"),
     insight: z.string().describe("One key pattern or insight discovered"),
@@ -86,35 +87,13 @@ const storeConsolidation = tool(
         }),
       )
       .describe("Connections between memories"),
-  },
-  async (args) => jsonResult(db.storeConsolidation(args)),
-);
+  }),
+  run: async (input) => jsonText(db.storeConsolidation(input)),
+});
 
-const readConsolidationHistory = tool(
-  "read_consolidation_history",
-  "Read past consolidation insights.",
-  {},
-  async () => jsonResult(db.readConsolidationHistory()),
-);
-
-const getMemoryStats = tool(
-  "get_memory_stats",
-  "Get current memory statistics (counts of memories and consolidations).",
-  {},
-  async () => jsonResult(db.getMemoryStats()),
-);
-
-export const memoryServer = createSdkMcpServer({
-  name: "memory",
-  version: "1.0.0",
-  tools: [
-    storeMemory,
-    searchMemories,
-    updateMemory,
-    readAllMemories,
-    readUnconsolidatedMemories,
-    storeConsolidation,
-    readConsolidationHistory,
-    getMemoryStats,
-  ],
+export const readConsolidationHistory = betaZodTool({
+  name: "read_consolidation_history",
+  description: "Read past consolidation insights.",
+  inputSchema: z.object({}),
+  run: async () => jsonText(db.readConsolidationHistory()),
 });

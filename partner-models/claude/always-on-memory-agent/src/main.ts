@@ -3,7 +3,7 @@
  *
  * A lightweight, cost-effective background agent that continuously
  * processes, consolidates, and serves memory. Runs 24/7 on Claude Haiku
- * via the Claude Agent SDK.
+ * via the Anthropic SDK's tool runner.
  *
  * Usage:
  *     npm start                                     # watch ./inbox, serve on :8888
@@ -36,7 +36,15 @@ const consolidateEveryMin = Number(values["consolidate-every"]);
 const host = setting("MEMORY_HOST", "server.host") ?? "127.0.0.1";
 const apiToken = setting("MEMORY_API_TOKEN", "server.token");
 
-const agent = new MemoryAgent(watchDir);
+const agent = new MemoryAgent();
+
+if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
+  console.warn(
+    `[${time()}] ⚠️  ANTHROPIC_API_KEY is not set — the SDK will try other ` +
+      `credential sources (e.g. an \`ant auth login\` profile); LLM calls ` +
+      `will fail if none are available.`,
+  );
+}
 
 console.log(`[${time()}] 🧠 Agent Memory Layer starting`);
 console.log(`   Model: ${MODEL}`);

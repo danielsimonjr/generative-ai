@@ -1,26 +1,26 @@
-# Always On Memory Agent (TypeScript + Claude Agent SDK)
+# Always On Memory Agent (TypeScript + Anthropic SDK)
 
-**An always-on AI memory agent built with the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) + Claude Haiku**
+**An always-on AI memory agent built with the [Anthropic TypeScript SDK](https://github.com/anthropics/anthropic-sdk-typescript) tool runner + Claude Haiku**
 
-This is a TypeScript port of the [Google ADK + Gemini original](../../../gemini/agents/always-on-memory-agent/), rebuilt on Anthropic's Claude Agent SDK. Most AI agents have amnesia — they process information when asked, then forget everything. This project gives an agent a persistent, evolving memory that runs 24/7 as a lightweight background process, continuously processing, consolidating, and connecting information.
+This is a TypeScript port of the [Google ADK + Gemini original](../../../gemini/agents/always-on-memory-agent/), rebuilt on the Anthropic SDK's tool runner. Most AI agents have amnesia — they process information when asked, then forget everything. This project gives an agent a persistent, evolving memory that runs 24/7 as a lightweight background process, continuously processing, consolidating, and connecting information.
 
 No vector database. No embeddings. Just an LLM that reads, thinks, and writes structured memory.
 
 ## Architecture
 
-The Google ADK concepts map directly onto the Claude Agent SDK:
+The Google ADK concepts map directly onto the Anthropic SDK:
 
-| Google ADK (original)                | Claude Agent SDK (this port)                          |
+| Google ADK (original)                | Anthropic SDK (this port)                             |
 | ------------------------------------ | ----------------------------------------------------- |
-| `Agent` + `sub_agents` + LLM routing | Three specialist `query()` configurations, routed deterministically in code |
-| Python function tools                | In-process MCP server (`createSdkMcpServer` + `tool`) |
+| `Agent` + `sub_agents` + LLM routing | Three specialist tool-runner configurations, routed deterministically in code |
+| Python function tools                | Runnable tools (`betaZodTool` + Zod schemas)          |
 | Gemini 3.1 Flash-Lite                | Claude Haiku (`claude-haiku-4-5`)                     |
-| `Runner` + `InMemorySessionService`  | One stateless `query()` call per operation            |
-| Inline multimodal bytes              | Built-in `Read` tool (images, PDFs)                   |
+| `Runner` + `InMemorySessionService`  | One stateless `toolRunner()` call per operation       |
+| Inline multimodal bytes              | Inline base64 content blocks (images, PDFs)           |
 | aiohttp HTTP API                     | Node built-in `http` server                           |
 | SQLite via `sqlite3`                 | SQLite via built-in `node:sqlite`                     |
 
-Three specialist agents share one SQLite memory store, exposed to them as an in-process MCP server:
+Each operation is one direct Messages API loop — no subprocess, no coding-agent harness — which keeps per-operation latency and token overhead to a minimum for a service that runs 24/7. Three specialist agents share one SQLite memory store through their tools:
 
 - **ingest-agent** — extracts summary, entities, topics, and importance from new input, then searches for closely related existing memories: duplicates and corrections **update the existing memory in place** (`update_memory`); genuinely new information is stored (`store_memory`). A verification retry ensures ingestion never fails silently.
 - **consolidate-agent** — periodically reviews unconsolidated memories, finds connections, and stores cross-cutting insights
@@ -28,7 +28,7 @@ Three specialist agents share one SQLite memory store, exposed to them as an in-
 
 Every operation logs its turn count, duration, and cost, so you can watch what 24/7 operation actually costs.
 
-Each specialist is a scoped `query()` call: its own system prompt, its own tool allowlist (`allowedTools`), same shared memory server. The original used an LLM orchestrator with `sub_agents` to route requests; here every entry point (file watcher, HTTP endpoint, consolidation timer) already knows its intent, so routing happens in code — one less model hop per request, which matters for an agent that runs 24/7. (The Agent SDK's subagent mechanism also currently runs subagents as background tasks and does not expose in-process SDK MCP servers to them, which rules out a faithful `Task`-tool orchestrator for this design.)
+Each specialist is a scoped tool-runner call: its own system prompt, its own tool set, same shared memory store. The original used an LLM orchestrator with `sub_agents` to route requests; here every entry point (file watcher, HTTP endpoint, consolidation timer) already knows its intent, so routing happens in code — one less model hop per request, which matters for an agent that runs 24/7.
 
 ## How It Works
 
@@ -58,7 +58,7 @@ Input: "Anthropic reports 62% of Claude usage is code-related.
 | Images    | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`                       |
 | Documents | `.pdf`                                                         |
 
-> **Note:** unlike the Gemini original, audio and video files are not supported — Claude models do not process audio or video input. Media files are ingested via the SDK's built-in `Read` tool rather than inline bytes.
+> **Note:** unlike the Gemini original, audio and video files are not supported — Claude models do not process audio or video input. Images and PDFs are sent inline as base64 content blocks, just like the original does with Gemini.
 
 Before storing, the ingest agent searches existing memories: if the new input duplicates or corrects something already stored (e.g. "the launch slipped from March 15 to April 1"), it updates that memory in place instead of creating a near-duplicate. Updated memories are re-queued for consolidation. Modified inbox files are re-ingested automatically (the watcher tracks modification times).
 
@@ -102,7 +102,7 @@ npm install
 export ANTHROPIC_API_KEY="your-anthropic-api-key"
 ```
 
-Get a key from the [Claude Console](https://platform.claude.com/). The Claude Agent SDK also picks up an existing Claude Code login automatically.
+Get a key from the [Claude Console](https://platform.claude.com/). The SDK also accepts `ANTHROPIC_AUTH_TOKEN` or an `ant auth login` profile.
 
 ### 3. Start the agent
 
@@ -228,13 +228,13 @@ For example, with `inbox = /var/data/inbox` in `config.ini`, running `MEMORY_INB
 | -------- | ------------------ | ------------------------------- |
 | `MODEL`  | `claude-haiku-4-5` | Claude model used by all agents |
 
-The Claude Agent SDK reads `ANTHROPIC_API_KEY` for authentication (see Quick Start).
+The Anthropic SDK reads `ANTHROPIC_API_KEY` for authentication (see Quick Start).
 
 ## Security Notes
 
 - The HTTP API binds `127.0.0.1` by default and supports bearer-token auth (see Server settings above) — turn the token on before exposing it beyond localhost.
-- The ingest agent's `Read` tool is granted per file-ingestion call only and is confined to the inbox directory, so a malicious dropped file can't instruct the agent to read elsewhere on disk.
-- Everything else the agents can do goes through the memory MCP tools, which only touch the SQLite database.
+- The agents have no filesystem, shell, or network tools at all — the app itself reads inbox files and sends media inline, so a malicious dropped file can't instruct the agent to read elsewhere on disk.
+- Everything the agents can do goes through the memory tools, which only touch the SQLite database.
 
 ## Tests
 
@@ -249,8 +249,8 @@ npm run typecheck
 always-on-memory-agent/
 ├── src/
 │   ├── main.ts        # Entry point: watcher + timer + HTTP server
-│   ├── agent.ts       # Specialist agents (Claude Agent SDK)
-│   ├── tools.ts       # Memory tools as an in-process MCP server
+│   ├── agent.ts       # Specialist agents (Anthropic SDK tool runner)
+│   ├── tools.ts       # Memory tools (betaZodTool definitions)
 │   ├── db.ts          # SQLite memory store + FTS5 search (node:sqlite)
 │   ├── config.ts      # INI config loader (config.ini)
 │   ├── dashboard.ts   # Single-page web dashboard (served at GET /)
@@ -275,7 +275,7 @@ This agent runs continuously. Cost and speed matter more than raw intelligence f
 
 ## Built With
 
-- [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) (`@anthropic-ai/claude-agent-sdk`) for agent orchestration, subagents, and tools
+- [Anthropic TypeScript SDK](https://github.com/anthropics/anthropic-sdk-typescript) (`@anthropic-ai/sdk`) — tool runner + Zod tools for the agentic loops
 - [Claude Haiku](https://platform.claude.com/docs/en/about-claude/models/overview) for all LLM operations
 - `node:sqlite` for persistent memory storage
 - Node built-in `http` for the API
