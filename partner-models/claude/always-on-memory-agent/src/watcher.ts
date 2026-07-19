@@ -29,17 +29,19 @@ export function startWatcher(
       for (const name of entries) {
         if (name.startsWith(".")) continue;
         const filePath = path.join(folder, name);
-        if (!fs.statSync(filePath).isFile()) continue;
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile()) continue;
+        const mtimeMs = stat.mtimeMs;
 
         const ext = path.extname(name).toLowerCase();
         if (!ALL_SUPPORTED.has(ext)) {
-          if (UNSUPPORTED_MEDIA.has(ext) && !isFileProcessed(filePath)) {
+          if (UNSUPPORTED_MEDIA.has(ext) && !isFileProcessed(filePath, mtimeMs)) {
             console.warn(`[${time()}] ⚠️  Skipping ${name} — Claude does not support this media type`);
-            markFileProcessed(filePath);
+            markFileProcessed(filePath, mtimeMs);
           }
           continue;
         }
-        if (isFileProcessed(filePath)) continue;
+        if (isFileProcessed(filePath, mtimeMs)) continue;
 
         try {
           if (TEXT_EXTENSIONS.has(ext)) {
@@ -55,7 +57,7 @@ export function startWatcher(
         } catch (err) {
           console.error(`[${time()}] Error ingesting ${name}:`, err);
         }
-        markFileProcessed(filePath);
+        markFileProcessed(filePath, mtimeMs);
       }
     } catch (err) {
       console.error(`[${time()}] Watch error:`, err);
