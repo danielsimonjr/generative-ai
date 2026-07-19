@@ -16,6 +16,8 @@ let db: DatabaseSync | undefined;
 export function getDb(): DatabaseSync {
   if (!db) {
     db = new DatabaseSync(DB_PATH);
+    // Write-ahead logging: better crash durability, readers don't block writers
+    db.exec("PRAGMA journal_mode = WAL");
     db.exec(`
       CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +42,10 @@ export function getDb(): DatabaseSync {
         path TEXT PRIMARY KEY,
         processed_at TEXT NOT NULL,
         mtime_ms REAL NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS ingest_hashes (
+        hash TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
       );
     `);
     // Migrate databases created before the mtime_ms column existed
@@ -303,10 +309,23 @@ export function markFileProcessed(path: string, mtimeMs: number): void {
     .run(path, new Date().toISOString(), mtimeMs);
 }
 
+/** Has this exact input content been ingested before? (dedup fast path) */
+export function hasIngestHash(hash: string): boolean {
+  return Boolean(getDb().prepare("SELECT 1 FROM ingest_hashes WHERE hash = ?").get(hash));
+}
+
+export function recordIngestHash(hash: string): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO ingest_hashes (hash, created_at) VALUES (?, ?)")
+    .run(hash, new Date().toISOString());
+}
+
 export function clearAllMemories() {
   const database = getDb();
   const memCount = (database.prepare("SELECT COUNT(*) as c FROM memories").get() as { c: number }).c;
-  database.exec("DELETE FROM memories; DELETE FROM consolidations; DELETE FROM processed_files;");
+  database.exec(
+    "DELETE FROM memories; DELETE FROM consolidations; DELETE FROM processed_files; DELETE FROM ingest_hashes;",
+  );
   return memCount;
 }
 

@@ -60,7 +60,13 @@ Input: "Anthropic reports 62% of Claude usage is code-related.
 
 > **Note:** unlike the Gemini original, audio and video files are not supported — Claude models do not process audio or video input. Images and PDFs are sent inline as base64 content blocks, just like the original does with Gemini.
 
-Before storing, the ingest agent searches existing memories: if the new input duplicates or corrects something already stored (e.g. "the launch slipped from March 15 to April 1"), it updates that memory in place instead of creating a near-duplicate. Updated memories are re-queued for consolidation. Modified inbox files are re-ingested automatically (the watcher tracks modification times).
+Ingestion has three layers of protection against waste and loss:
+
+- **Exact duplicates never reach the model** — input content is hashed (SHA-256), and re-drops or repeated posts of identical content are skipped for free
+- **Fuzzy duplicates and corrections update in place** — the ingest agent searches existing memories first; if the new input covers or corrects something already stored (e.g. "the launch slipped from March 15 to April 1"), it updates that memory instead of creating a near-duplicate, and re-queues it for consolidation
+- **Failures are retried, not swallowed** — a file that fails to ingest (e.g. transient API outage) stays unmarked and is retried on later polls, up to 3 attempts per file version
+
+Modified inbox files are re-ingested automatically (the watcher tracks modification times). Write operations (ingest, consolidate) are serialized through a mutex so overlapping triggers can't double-process; read-only queries run concurrently.
 
 **Three ways to ingest:**
 
@@ -235,6 +241,9 @@ The Anthropic SDK reads `ANTHROPIC_API_KEY` for authentication (see Quick Start)
 - The HTTP API binds `127.0.0.1` by default and supports bearer-token auth (see Server settings above) — turn the token on before exposing it beyond localhost.
 - The agents have no filesystem, shell, or network tools at all — the app itself reads inbox files and sends media inline, so a malicious dropped file can't instruct the agent to read elsewhere on disk.
 - Everything the agents can do goes through the memory tools, which only touch the SQLite database.
+- Ingested content is framed as untrusted data (`<content>` tags plus an explicit instruction), so text that *looks like* commands is recorded as a memory rather than acted on.
+- Request bodies are capped at 1 MB — oversized uploads get a clean `413` (rejected before the body is even sent when the client uses `Expect: 100-continue`).
+- The database runs in SQLite WAL mode for crash durability.
 
 ## Tests
 
