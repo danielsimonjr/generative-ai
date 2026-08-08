@@ -6,13 +6,9 @@ on:
   schedule:
     - cron: "00 18 * * *"
 
-# Declared so this works the moment the repo's Actions permission ceiling is raised
-# from read to write. A workflow can only REDUCE from the repo default, never exceed
-# it, so while the ceiling is `read` this block is aspirational and the issue step
-# below fails with "Resource not accessible by integration".
+# Least privilege: this job only reads the tree and reports. It files nothing.
 permissions:
   contents: read
-  issues: write
 
 jobs:
   linkChecker:
@@ -58,19 +54,16 @@ jobs:
       # broken links reported success AND skipped this step, which is worse than the
       # daily red it replaced -- red at least meant something. The step output carries
       # the real code, so the issue still gets filed.
-      - name: Create Issue From File
-        if: steps.lychee.outputs.exit_code != 0
-        # continue-on-error because the repo's Actions token is currently read-only,
-        # so this step cannot open an issue and fails with "Resource not accessible by
-        # integration". Without this the job goes red again -- trading link-rot red for
-        # permissions red, which is no improvement.
-        #
-        # The step is deliberately left ENABLED and visibly failing rather than deleted:
-        # it starts working the instant the ceiling is raised, and a visibly failing
-        # step is a standing reminder that link reports are not being delivered.
-        continue-on-error: true
-        uses: peter-evans/create-issue-from-file@v5
-        with:
-          title: Link Checker Report
-          content-filepath: ./lychee/out.md
-          labels: report, automated issue
+      # NO issue-filing step. Issues are DISABLED on this fork, so
+      # peter-evans/create-issue-from-file can never succeed here -- it failed with
+      # "Resource not accessible by integration", and continue-on-error was merely
+      # hiding that. A step that cannot work under any circumstance is worse than no
+      # step: it reports success while delivering nothing.
+      #
+      # lychee-action writes its report to the job summary, which is where the link
+      # rot is now visible. If issue reports are wanted, enable Issues on the repo and
+      # restore the step -- the permissions block above is already in place for it.
+      - name: Report
+        run: |
+          echo "lychee exit code: ${{ steps.lychee.outputs.exit_code }}"
+          echo "Full report is in the job summary above."
