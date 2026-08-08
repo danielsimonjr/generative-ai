@@ -15,6 +15,21 @@ jobs:
       - name: Link Checker
         id: lychee
         uses: lycheeverse/lychee-action@v2
+        with:
+          # --root-dir: this repo is full of web sample apps whose HTML uses
+          # root-relative hrefs (/vite.svg, /assets/foo.png, /static/style.css).
+          # Without a root, lychee cannot resolve them and reports every one as an
+          # error -- which is what made this job fail on every scheduled run rather
+          # than surfacing an actual broken link.
+          #
+          # --exclude: Angular templates interpolate filenames ({{icon}}.svg), which
+          # url-encode to %7B%7B...%7D%7D. Those are bindings, not links.
+          args: >-
+            --no-progress
+            --root-dir "$GITHUB_WORKSPACE"
+            --exclude '.*%7B%7B.*'
+            --exclude '.*\{\{.*'
+            .
 
       - name: Create Issue From File
         if: env.lychee_exit_code != 0
