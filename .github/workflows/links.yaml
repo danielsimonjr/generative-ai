@@ -6,6 +6,14 @@ on:
   schedule:
     - cron: "00 18 * * *"
 
+# Declared so this works the moment the repo's Actions permission ceiling is raised
+# from read to write. A workflow can only REDUCE from the repo default, never exceed
+# it, so while the ceiling is `read` this block is aspirational and the issue step
+# below fails with "Resource not accessible by integration".
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   linkChecker:
     runs-on: ubuntu-latest
@@ -52,6 +60,15 @@ jobs:
       # the real code, so the issue still gets filed.
       - name: Create Issue From File
         if: steps.lychee.outputs.exit_code != 0
+        # continue-on-error because the repo's Actions token is currently read-only,
+        # so this step cannot open an issue and fails with "Resource not accessible by
+        # integration". Without this the job goes red again -- trading link-rot red for
+        # permissions red, which is no improvement.
+        #
+        # The step is deliberately left ENABLED and visibly failing rather than deleted:
+        # it starts working the instant the ceiling is raised, and a visibly failing
+        # step is a standing reminder that link reports are not being delivered.
+        continue-on-error: true
         uses: peter-evans/create-issue-from-file@v5
         with:
           title: Link Checker Report
