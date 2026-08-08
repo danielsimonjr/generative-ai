@@ -23,13 +23,27 @@ jobs:
           # than surfacing an actual broken link.
           #
           # --exclude: Angular templates interpolate filenames ({{icon}}.svg), which
-          # url-encode to %7B%7B...%7D%7D. Those are bindings, not links.
+          # url-encode to %7B%7B...%7D%7D. Those are bindings, not links. localhost
+          # URLs appear throughout the getting-started docs and cannot resolve in CI
+          # by definition.
           args: >-
             --no-progress
             --root-dir "$GITHUB_WORKSPACE"
             --exclude '.*%7B%7B.*'
             --exclude '.*\{\{.*'
+            --exclude '^https?://localhost'
+            --exclude '^https?://127\.0\.0\.1'
             .
+          # Report, do not block. This is a FORK of an upstream samples repo with
+          # thousands of files, and what remains after the excludes above is
+          # upstream's own link rot -- ~76 missing-file references inside Google's
+          # notebooks and gitignored build output. We do not maintain that content,
+          # and failing a scheduled job on it means the job is red every day and
+          # nobody reads it.
+          #
+          # The next step already files an issue whenever lychee finds anything, keyed
+          # on lychee_exit_code, so the signal survives. Only the false red goes away.
+          fail: false
 
       - name: Create Issue From File
         if: env.lychee_exit_code != 0
